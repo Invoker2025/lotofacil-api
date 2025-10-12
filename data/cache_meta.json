@@ -1,0 +1,18 @@
+{
+  "source": "api",
+  "ts": 1760127951.679748,
+  "updated_at": "2025-10-10T17:25:51.679748",
+  "items": 290,
+  "saved": {
+    "kind": "parquet",
+    "path": "C:\\lotofacil-api\\data\\cache_lotofacil.parquet"
+  },
+  "info": {
+    "source": "api",
+    "coverage_months": 12,
+    "min_date": "14/10/2024",
+    "max_date": "09/10/2025",
+    "min_concurso": 3219,
+    "max_concurso": 3508
+  }
+}
