@@ -1,334 +1,128 @@
-# main.py
-# -------------------------------------------
-# Lotofácil API (FastAPI) – sem CSV
-# - Busca direta na API oficial da CAIXA (portaldeloterias)
-# - Pré-cache 1..12 meses
-# - Aceita qualquer months >= 1 (limite seguro configurável)
-# - Frequências/combinação segundo a sua regra
-# - Scheduler atualiza tudo que já estiver no cache
-# -------------------------------------------
-
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from typing import List, Optional, Dict, Any
+import requests
+from bs4 import BeautifulSoup
+from datetime import datetime, timedelta
 from apscheduler.schedulers.background import BackgroundScheduler
 
-from datetime import datetime
-from dateutil.relativedelta import relativedelta
+app = FastAPI(title="Lotofacil API", version="2.0")
 
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+# ==========================
+# CONFIGURAÇÕES CORS (para permitir o app acessar)
+# ==========================
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-app = FastAPI()
+# ==========================
+# CACHE LOCAL (em memória)
+# ==========================
+cache_data = {}
+cache_time = {}
+
+# ==========================
+# ENDPOINT DE SAÚDE
+# ==========================
 
 
 @app.get("/health")
 def health_check():
     return {"status": "ok", "message": "Lotofacil API online!"}
 
-# -------------- Config ---------------
+# ==========================
+# FUNÇÃO PRINCIPAL: BUSCAR RESULTADOS DO SITE
+# ==========================
 
 
-CAIXA_BASE = "https://servicebus2.caixa.gov.br/portaldeloterias/api/lotofacil"
-TIMEOUT = 15
-# pré-carregar (rápido)
-CACHE_MONTH_CHOICES = list(range(1, 13))  # 1..12
-# aceitar on-demand até este teto (15, 20, 30... até 36 por padrão)
-SAFE_MAX_MONTHS = 36
-
-
-# -------------- App + CORS ---------------
-
-app = FastAPI(title="Lotofácil API", version="2.1.0")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],        # em produção: ["https://SEU-DOMINIO.com"]
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-
-# -------------- Modelos ---------------
-
-class Frequencia(BaseModel):
-    dezena: int
-    freq: int
-
-
-class LotofacilResponse(BaseModel):
-    periodo: str
-    final_15: List[int]
-    top12: List[int]
-    bottom3: List[int]
-    frequencias: List[Frequencia]
-    total_concursos_periodo: int
-    total_concursos_total: int
-    source: Optional[str] = None
-    coverage: Optional[Dict[str, Any]] = None
-    last_updated: Optional[str] = None
-
-
-# -------------- Sessão HTTP com retry ---------------
-
-def make_session() -> requests.Session:
-    s = requests.Session()
-    retries = Retry(
-        total=5,
-        backoff_factor=0.5,
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["GET"],
-    )
-    adapter = HTTPAdapter(max_retries=retries)
-    s.mount("https://", adapter)
-    s.mount("http://", adapter)
-    # headers para evitar 403 da CAIXA
-    s.headers.update({
-        "User-Agent": (
-            "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
-            "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 "
-            "Mobile/15E148 Safari/604.1"
-        ),
-        "Accept": "application/json, text/plain, */*",
-        "Referer": "https://loterias.caixa.gov.br/",
-    })
-    return s
-
-
-SESSION = make_session()
-
-
-# -------------- Utilitários ---------------
-
-def parse_data_apuracao(s: str) -> datetime:
-    for fmt in ("%d/%m/%Y", "%d/%m/%Y %H:%M:%S"):
-        try:
-            return datetime.strptime(s, fmt)
-        except ValueError:
-            pass
-    try:
-        return datetime.fromisoformat(s)
-    except Exception:
-        return datetime.utcnow()
-
-
-def asc(nums: List[int]) -> List[int]:
-    return sorted(nums)
-
-
-def is_even(n: int) -> bool:
-    return n % 2 == 0
-
-
-def is_odd(n: int) -> bool:
-    return n % 2 == 1
-
-
-# -------------- Estratégia pedida ---------------
-
-def build_6even6odd_top__2even1odd_bottom(freqs: List[Frequencia]) -> List[int]:
-    top_sorted = sorted(freqs, key=lambda f: (-f.freq, f.dezena))
-    bottom_sorted = sorted(freqs, key=lambda f: (f.freq, f.dezena))
-
-    top_pool = [f.dezena for f in top_sorted]
-    bottom_pool = [f.dezena for f in bottom_sorted]
-
-    chosen = set()
-    result: List[int] = []
-
-    # top: 6 pares + 6 ímpares
-    for n in top_pool:
-        if len([x for x in result if is_even(x)]) >= 6:
-            break
-        if n not in chosen and is_even(n):
-            chosen.add(n)
-            result.append(n)
-    for n in top_pool:
-        if len([x for x in result if is_odd(x)]) >= 6:
-            break
-        if n not in chosen and is_odd(n):
-            chosen.add(n)
-            result.append(n)
-
-    # bottom: 2 pares + 1 ímpar
-    for n in bottom_pool:
-        if len([x for x in result if is_even(x)]) >= 8:
-            break  # 6 (top) + 2
-        if n not in chosen and is_even(n):
-            chosen.add(n)
-            result.append(n)
-    for n in bottom_pool:
-        if len([x for x in result if is_odd(x)]) >= 7:
-            break   # 6 (top) + 1
-        if n not in chosen and is_odd(n):
-            chosen.add(n)
-            result.append(n)
-
-    # completa até 15 com top
-    for n in top_pool:
-        if len(result) >= 15:
-            break
-        if n not in chosen:
-            chosen.add(n)
-            result.append(n)
-
-    return asc(result[:15])
-
-
-# -------------- Coleta da CAIXA ---------------
-
-def caixa_get_latest() -> Dict[str, Any]:
-    r = SESSION.get(CAIXA_BASE, timeout=TIMEOUT)
-    r.raise_for_status()
-    return r.json()
-
-
-def caixa_get_concurso(numero: int) -> Dict[str, Any]:
-    r = SESSION.get(f"{CAIXA_BASE}/{numero}", timeout=TIMEOUT)
-    if r.status_code == 404:
-        r = SESSION.get(f"{CAIXA_BASE}?concurso={numero}", timeout=TIMEOUT)
-    r.raise_for_status()
-    return r.json()
-
-
-def coletar_periodo(months: int) -> List[Dict[str, Any]]:
+def get_results_from_site(months: int):
     """
-    Parte do último concurso e retrocede até cruzar a data limite (now - months).
+    Busca os concursos da Lotofácil direto do site numeromania.com.br
     """
-    latest = caixa_get_latest()
-    lista = []
+    base_url = "https://www.numeromania.com.br/estatisticas_lotofacil.asp"
+    results = []
+    end_date = datetime.today()
+    start_date = end_date - timedelta(days=months * 30)
 
-    def extrair(obj: Dict[str, Any]) -> Dict[str, Any]:
-        return {
-            "numero": int(obj.get("numero")),
-            "dataApuracao": obj.get("dataApuracao"),
-            "listaDezenas": [int(x) for x in obj.get("listaDezenas", [])],
-        }
-
-    first = extrair(latest)
-    lista.append(first)
-
-    limite = datetime.utcnow() - relativedelta(months=months)
-    atual = first["numero"] - 1
-
-    while atual > 0:
+    for page in range(1, 50):  # percorre várias páginas se necessário
+        url = f"{base_url}?pagina={page}"
         try:
-            cur = extrair(caixa_get_concurso(atual))
+            response = requests.get(url, timeout=15)
+            if response.status_code != 200:
+                break
+
+            soup = BeautifulSoup(response.text, "html.parser")
+            rows = soup.select("table tr")
+
+            for row in rows:
+                cols = [c.text.strip() for c in row.find_all("td")]
+                if len(cols) < 16:
+                    continue
+                try:
+                    concurso = int(cols[0])
+                    data_str = cols[1]
+                    data = datetime.strptime(data_str, "%d/%m/%Y")
+                    dezenas = [int(n) for n in cols[2:17]]
+
+                    if start_date <= data <= end_date:
+                        results.append({
+                            "concurso": concurso,
+                            "data": data_str,
+                            "numeros": dezenas
+                        })
+                except Exception:
+                    continue
         except Exception:
             break
-        dt = parse_data_apuracao(cur["dataApuracao"])
-        if dt < limite:
-            break
-        lista.append(cur)
-        atual -= 1
 
-    lista.sort(key=lambda d: parse_data_apuracao(d["dataApuracao"]))
-    return lista
+    return results
+
+# ==========================
+# ENDPOINT PRINCIPAL
+# ==========================
 
 
-# -------------- Frequências ---------------
+@app.get("/lotofacil")
+def get_lotofacil(months: int = Query(3, ge=1, le=60)):
+    """
+    Retorna concursos da Lotofácil dos últimos X meses.
+    Aceita até 60 meses, embora 1–12 seja mais rápido.
+    """
+    now = datetime.now()
+    # cache válido por 6h
+    if months in cache_data and (now - cache_time[months]).seconds < 6 * 3600:
+        print(f"[CACHE] Servindo cache de {months}m")
+        return {"meses": months, "concursos": cache_data[months]}
 
-def calcular_frequencias(draws: List[Dict[str, Any]]) -> List[Frequencia]:
-    counts = {i: 0 for i in range(1, 26)}
-    for d in draws:
-        for n in d["listaDezenas"]:
-            if 1 <= n <= 25:
-                counts[n] += 1
-    return [Frequencia(dezena=i, freq=counts[i]) for i in range(1, 26)]
+    print(f"[SITE] Atualizando dados para {months} meses...")
+    results = get_results_from_site(months)
+    cache_data[months] = results
+    cache_time[months] = now
+    return {"meses": months, "concursos": results, "qtd": len(results)}
 
-
-# -------------- Cache ---------------
-
-class CacheEntry(BaseModel):
-    response: LotofacilResponse
-    last_updated: str
-
-
-CACHE: Dict[int, CacheEntry] = {}  # chave: months
-
-
-def montar_resposta(months: int) -> LotofacilResponse:
-    draws = coletar_periodo(months)
-    total_periodo = len(draws)
-
-    freqs = calcular_frequencias(draws)
-    top12 = [f.dezena for f in sorted(
-        freqs, key=lambda f: (-f.freq, f.dezena))[:12]]
-    bottom3 = [f.dezena for f in sorted(
-        freqs, key=lambda f: (f.freq, f.dezena))[:3]]
-    final_15 = build_6even6odd_top__2even1odd_bottom(freqs)
-
-    periodo_txt = f"Últimos {months} " + ("mês" if months == 1 else "meses")
-    resp = LotofacilResponse(
-        periodo=periodo_txt,
-        final_15=final_15,
-        top12=top12,
-        bottom3=bottom3,
-        frequencias=freqs,
-        total_concursos_periodo=total_periodo,
-        total_concursos_total=0,  # opcional: buscar total histórico depois
-        source="caixa:portaldeloterias",
-        coverage={"months": months},
-        last_updated=datetime.utcnow().isoformat(),
-    )
-    return resp
+# ==========================
+# AGENDAMENTO AUTOMÁTICO
+# ==========================
 
 
-def atualizar_cache_for(months: int):
-    try:
-        resp = montar_resposta(months)
-        CACHE[months] = CacheEntry(
-            response=resp, last_updated=resp.last_updated)
-        print(
-            f"[CACHE] Atualizado para {months}m: {resp.total_concursos_periodo} concursos")
-    except Exception as e:
-        print(f"[CACHE] Falha ao atualizar {months}m:", e)
+def update_cache():
+    for m in [1, 2, 3, 4, 5, 6, 12]:
+        data = get_results_from_site(m)
+        cache_data[m] = data
+        cache_time[m] = datetime.now()
+        print(f"[CACHE] Atualizado para {m}m: {len(data)} concursos")
 
-
-# -------------- Scheduler ---------------
 
 scheduler = BackgroundScheduler()
+scheduler.add_job(update_cache, "interval", hours=6)
+scheduler.start()
 
-
-@app.on_event("startup")
-def on_startup():
-    # pré-carrega 1..12 (rápido)
-    for m in CACHE_MONTH_CHOICES:
-        atualizar_cache_for(m)
-
-    # Atualiza periodicamente TUDO que já está no cache (inclui 15/20/30 após 1ª chamada)
-    scheduler.add_job(
-        lambda: [atualizar_cache_for(m) for m in list(CACHE.keys())],
-        "interval",
-        minutes=15,
-        id="lotofacil_update",
-        replace_existing=True
-    )
-    scheduler.start()
-
-
-@app.on_event("shutdown")
-def on_shutdown():
-    scheduler.shutdown()
-
-
-# -------------- Endpoints ---------------
-
-@app.get("/health")
-def health():
-    return {"status": "ok", "cache": {m: c.last_updated for m, c in CACHE.items()}}
-
-
-@app.get("/lotofacil", response_model=LotofacilResponse)
-def lotofacil(months: int = Query(3, ge=1)):
-    # aplica teto de segurança para proteger a CAIXA/servidor
-    if months > SAFE_MAX_MONTHS:
-        months = SAFE_MAX_MONTHS
-
-    # gera on-demand se não existir (1ª vez pode demorar)
-    if months not in CACHE:
-        atualizar_cache_for(months)
-
-    return CACHE[months].response
+# ==========================
+# EXECUÇÃO LOCAL
+# ==========================
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8900, reload=True)
