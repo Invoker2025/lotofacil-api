@@ -21,8 +21,15 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+app = FastAPI()
+
+
+@app.get("/health")
+def health_check():
+    return {"status": "ok", "message": "Lotofacil API online!"}
 
 # -------------- Config ---------------
+
 
 CAIXA_BASE = "https://servicebus2.caixa.gov.br/portaldeloterias/api/lotofacil"
 TIMEOUT = 15
