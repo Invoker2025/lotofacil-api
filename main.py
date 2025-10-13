@@ -3,311 +3,266 @@ import re
 import time
 import math
 import json
-from datetime import datetime, timedelta, timezone
-from typing import Dict, Any, List, Tuple, Optional
+import typing as T
+from datetime import datetime, timedelta
 
 import requests
-from bs4 import BeautifulSoup
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
+from bs4 import BeautifulSoup
 
-# --------------------------------------------------------------------
-# Configurações
-# --------------------------------------------------------------------
-SORTEONLINE_URL = "https://www.sorteonline.com.br/lotofacil/resultados"
-SCRAPERAPI_KEY = os.getenv("SCRAPERAPI_KEY", "").strip()
-TIMEOUT = 30  # segundos
-DEFAULT_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
-    "Connection": "keep-alive",
-    "Referer": "https://www.sorteonline.com.br/",
-}
+# ------------------------------
+# Config
+# ------------------------------
+SCRAPER_KEY = os.getenv("SCRAPERAPI_KEY", "").strip()
+if not SCRAPER_KEY:
+    print("[WARN] SCRAPERAPI_KEY não definido no ambiente.")
 
-app = FastAPI(title="Lotofácil API (SorteOnline)", version="2.1.0")
+BASE_SO_URL = "https://www.sorteonline.com.br/lotofacil/resultados"
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+)
 
-# cache simples em memória para reduzir scraping repetido
-_CACHE: Dict[str, Tuple[float, Any]] = {}
-CACHE_TTL_SECONDS = 60  # 1 min
+# limites para não estourar proxy da Render
+REQUEST_TIMEOUT = 60  # requests -> ScraperAPI
+HARD_DEADLINE = 45    # tempo máximo de scraping total por request da nossa API
 
-# --------------------------------------------------------------------
-# Helpers de HTTP (ScraperAPI + fallback)
-# --------------------------------------------------------------------
+# ------------------------------
+# FastAPI
+# ------------------------------
+app = FastAPI(
+    title="Lotofácil API (SorteOnline via ScraperAPI)",
+    version="3.0.0",
+    contact={"name": "Invoker2025"},
+)
+
+# ------------------------------
+# Helpers de rede
+# ------------------------------
 
 
-def _scrape_get(url: str, *, render: bool = True, params: Optional[Dict[str, Any]] = None) -> requests.Response:
+def _scraper_get(url: str, *, render: bool = True, retries: int = 4, backoff: float = 1.5) -> requests.Response:
     """
-    Faz GET usando ScraperAPI se SCRAPERAPI_KEY existir; senão, faz direto.
-    Para SorteOnline, recomenda-se render=True (carrega o HTML pós-JS).
+    Faz GET via ScraperAPI com renderização JS, BR e headers preservados.
+    Tenta novamente em 429/5xx com backoff.
     """
-    params = params or {}
-    if SCRAPERAPI_KEY:
-        # ScraperAPI com renderização
-        saparams = {
-            "api_key": SCRAPERAPI_KEY,
-            "url": url,
-            "keep_headers": "true",
-            "country_code": "br",
-        }
-        if render:
-            saparams["render"] = "true"
-        resp = requests.get(
-            "https://api.scraperapi.com/",
-            params=saparams,
-            headers=DEFAULT_HEADERS,
-            timeout=TIMEOUT,
-        )
-        resp.raise_for_status()
-        return resp
-    else:
-        # Fallback direto (pode não renderizar o conteúdo JS)
-        resp = requests.get(url, headers=DEFAULT_HEADERS, timeout=TIMEOUT)
-        resp.raise_for_status()
-        return resp
+    if not SCRAPER_KEY:
+        raise RuntimeError("SCRAPERAPI_KEY ausente nas variáveis de ambiente.")
+
+    params = {
+        "api_key": SCRAPER_KEY,
+        "url": url,
+        "render": "true" if render else "false",
+        "country_code": "br",
+        "keep_headers": "true",
+        # Sites bem protegidos às vezes exigem premium/ultra; habilite se necessário:
+        # "premium": "true",
+        # "ultra_premium": "true",
+        # aumentar timeout do lado do ScraperAPI (em ms). default ~30s lá.
+        "timeout": str(60000),
+    }
+
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Referer": "https://www.sorteonline.com.br/",
+    }
+
+    last_exc = None
+    for attempt in range(retries):
+        try:
+            resp = requests.get(
+                "https://api.scraperapi.com/",
+                params=params,
+                headers=headers,
+                timeout=REQUEST_TIMEOUT,
+            )
+            # ScraperAPI devolve 200 mesmo quando o alvo devolve 403/404 etc.
+            # Vamos checar o status_code real do ScraperAPI:
+            if resp.status_code >= 500 or resp.status_code == 429:
+                # backoff em HTTP do proxy
+                time.sleep(backoff ** attempt)
+                continue
+            return resp
+        except requests.RequestException as exc:
+            last_exc = exc
+            time.sleep(backoff ** attempt)
+
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("Falha desconhecida no ScraperAPI")
 
 
-def _cache_get(key: str):
-    item = _CACHE.get(key)
-    if not item:
-        return None
-    ts, value = item
-    if (time.time() - ts) > CACHE_TTL_SECONDS:
-        return None
-    return value
+# ------------------------------
+# Parser SorteOnline (robusto)
+# ------------------------------
+RESULT_CARD_SEL = "article,div"  # fallback amplo
 
 
-def _cache_set(key: str, value: Any):
-    _CACHE[key] = (time.time(), value)
-
-
-# --------------------------------------------------------------------
-# Parsing dos resultados do SorteOnline (heurístico, tolerante)
-# --------------------------------------------------------------------
-_num_re = re.compile(r"\b([0-9]{1,2})\b")
-_dt_re = re.compile(r"(\d{2}/\d{2}/\d{4})")
-_conc_re = re.compile(r"[Cc]oncurso\s*#?\s*(\d+)")
-
-
-def _extract_15_numbers_from_html(html_fragment: str) -> Optional[List[int]]:
+def _parse_result_list(html: str) -> T.List[dict]:
     """
-    Recebe um trecho de HTML (string) e tenta extrair exatamente 15 dezenas (1..25).
-    Retorna lista de 15 ints ou None.
-    """
-    nums = [int(n) for n in _num_re.findall(html_fragment)]
-    # Filtra para intervalo válido
-    nums = [n for n in nums if 1 <= n <= 25]
-    # Alguns blocos podem ter números da data junto; tentamos pegar o maior bloco contínuo de 15 dezenas
-    if len(nums) < 15:
-        return None
-    # Estratégia: varrer janelas de tamanho 15 procurando sequência plausível
-    for i in range(0, len(nums) - 14):
-        window = nums[i: i + 15]
-        # heurística mínima: não permitir números repetidos demais (no sorteio são 15 únicos)
-        if len(set(window)) == 15:
-            return window
-    return None
-
-
-def parse_sorteonline(html: str) -> List[Dict[str, Any]]:
-    """
-    Varre a página de resultados do SorteOnline e retorna uma lista de concursos.
-    Cada item: {"concurso": int, "data": "YYYY-MM-DD", "dezenas": [..15 ints..]}
-    A página normalmente contém cards de vários concursos (recentes primeiro).
+    Tenta extrair uma lista de concursos a partir do HTML do SorteOnline.
+    Estruturas mudam com frequência, então o parser é tolerante.
+    Retorno: [{concurso:int, data:'YYYY-MM-DD', dezenas:[...]}]
     """
     soup = BeautifulSoup(html, "html.parser")
 
-    # 1) Tentar achar cards clássicos de resultado (ul/li com 15 bolas)
-    cards: List[Dict[str, Any]] = []
+    # 1) encontrar "cards" de resultados (divs/artigos com texto 'Concurso' e dezenas)
+    cards = []
+    for node in soup.select(RESULT_CARD_SEL):
+        txt = node.get_text(" ", strip=True)
+        if not txt:
+            continue
+        if "Concurso" in txt and re.search(r"\b\d{2}\b(?:\s*,\s*\d{2}){14}", txt):
+            cards.append(node)
 
-    # Heurística 1: qualquer bloco que contenha 15 números válidos
-    # Procuramos contêineres com possíveis cabeçalhos (contendo "Concurso" e data)
-    # e uma lista de dezenas perto.
-    for block in soup.find_all(True):
-        text = " ".join(block.get_text(" ", strip=True).split())
-        if ("Concurso" in text or "concurso" in text) and _dt_re.search(text):
-            # Encontrou um cabeçalho que provavelmente é um card de concurso
-            # Buscamos dezenas nos descendentes
-            dezenas = None
-            # 1a) procurar por listas claras (li / span)
-            candidates = block.find_all(["ul", "ol", "div"], recursive=True)
-            for c in candidates:
-                frag = str(c)
-                nums = _extract_15_numbers_from_html(frag)
-                if nums:
-                    dezenas = nums
-                    break
-            if not dezenas:
-                # 1b) tenta no próprio bloco
-                dezenas = _extract_15_numbers_from_html(str(block))
-            if dezenas:
-                # concurso
-                mconc = _conc_re.search(text)
-                conc = int(mconc.group(1)) if mconc else None
-                # data
-                mdt = _dt_re.search(text)
-                dt_str = mdt.group(1) if mdt else None
-                dt_iso = None
-                if dt_str:
-                    try:
-                        dt = datetime.strptime(dt_str, "%d/%m/%Y").date()
-                        dt_iso = dt.isoformat()
-                    except Exception:
-                        dt_iso = None
-                cards.append(
-                    {
-                        "concurso": conc,
-                        "data": dt_iso,
-                        "dezenas": sorted(dezenas),
-                        "fonte": "sorteonline",
-                    }
-                )
+    resultados: T.List[dict] = []
+    for card in cards:
+        text = card.get_text(" ", strip=True)
 
-    # Remover duplicados por concurso (mantém o 1º)
-    seen = set()
-    uniq = []
-    for c in cards:
-        key = c.get("concurso"), tuple(c.get("dezenas", []))
-        if key not in seen:
-            seen.add(key)
-            uniq.append(c)
+        # concurso: "Concurso 3201" ou "Concurso: 3201"
+        m_conc = re.search(r"Concurso[:\s]+(\d{3,5})", text, flags=re.I)
+        if not m_conc:
+            continue
+        concurso = int(m_conc.group(1))
 
-    # Ordena por concurso desc quando disponível, senão por data desc, senão fica como está
-    def _ord_key(item):
-        if item.get("concurso"):
-            return (0, -int(item["concurso"]))
-        elif item.get("data"):
-            return (1, item["data"])
-        return (2, 0)
-
-    uniq.sort(key=_ord_key)
-    return uniq
-
-
-def fetch_sorteonline_page(page: int = 1) -> Dict[str, Any]:
-    """
-    Baixa a página de resultados. O SorteOnline não usa paginação no mesmo padrão
-    em todas as épocas; então mantemos `page` para futura compatibilidade.
-    """
-    url = SORTEONLINE_URL
-    # Algumas versões usam página única com “carregar mais” via JS. Renderização já cobre isso.
-    resp = _scrape_get(url, render=True)
-    html = resp.text
-    concursos = parse_sorteonline(html)
-
-    return {
-        "page": page,
-        "url": url,
-        "qtd": len(concursos),
-        "sample": concursos[:3],  # mostra alguns no debug
-    }
-
-
-def get_concursos_last_months(months: int) -> Dict[str, Any]:
-    """
-    Coleta concursos dos últimos `months` meses.
-    Como a página já traz uma boa quantidade de concursos recentes, coletamos 1 página renderizada
-    e filtramos por data.
-    Se algum concurso não tiver data parseada, mantemos por segurança (melhor sobrar do que faltar).
-    """
-    cache_key = f"lotofacil:{months}"
-    cached = _cache_get(cache_key)
-    if cached:
-        return cached
-
-    resp = _scrape_get(SORTEONLINE_URL, render=True)
-    concursos = parse_sorteonline(resp.text)
-
-    # Filtro por meses: data >= hoje - months
-    cutoff = (datetime.now(timezone.utc) - timedelta(days=months * 30)).date()
-
-    def _keep(item):
-        if item.get("data"):
+        # data: formatos comuns "12/10/2025" ou "12-10-2025"
+        m_dt = re.search(r"(\d{2}[/-]\d{2}[/-]\d{4})", text)
+        data_iso = None
+        if m_dt:
             try:
-                d = datetime.fromisoformat(item["data"]).date()
-                return d >= cutoff
+                d = datetime.strptime(m_dt.group(
+                    1).replace("-", "/"), "%d/%m/%Y")
+                data_iso = d.strftime("%Y-%m-%d")
             except Exception:
-                return True
-        # se não tem data, mantemos
-        return True
+                pass
 
-    filtrados = [c for c in concursos if _keep(c)]
+        # dezenas: 15 números de 01 a 25
+        dezenas_match = re.search(r"\b(\d{2}(?:\s*,\s*\d{2}){14})\b", text)
+        dezenas = []
+        if dezenas_match:
+            dezenas = [int(x) for x in re.split(
+                r"\s*,\s*", dezenas_match.group(1))]
 
-    out = {
-        "meses": months,
-        "qtd": len(filtrados),
-        "concursos": filtrados,
-        "fonte": "sorteonline",
-    }
-    _cache_set(cache_key, out)
+        if dezenas:
+            resultados.append(
+                {"concurso": concurso, "data": data_iso, "dezenas": dezenas}
+            )
+
+    # Remover duplicados (se houver)
+    dedup = {}
+    for r in resultados:
+        dedup[r["concurso"]] = r
+    out = list(dedup.values())
+    out.sort(key=lambda x: x["concurso"], reverse=True)
     return out
 
+# ------------------------------
+# Endpoints
+# ------------------------------
 
-# --------------------------------------------------------------------
-# Rotas
-# --------------------------------------------------------------------
-@app.get("/")
+
+@app.get("/", summary="Root")
 def root():
-    return {
-        "ok": True,
-        "message": "Lotofácil API online. Use /health ou /lotofacil?months=3",
-        "docs": "/docs",
-    }
+    return {"ok": True, "message": "Lotofácil API online. Use /health, /debug?page=1 ou /lotofacil?months=3", "docs": "/docs"}
 
 
-@app.get("/health")
+@app.get("/health", summary="Health")
 def health():
-    # Amostra rápida de reachability da ScraperAPI (sem travar health)
     return {"status": "ok", "message": "Lotofácil API online!"}
 
 
-@app.get("/debug")
+@app.get("/debug", summary="Debug")
 def debug(page: int = Query(1, ge=1)):
     """
-    Mostra um pequeno diagnóstico do scraper (não retorna tudo para não pesar).
+    Baixa a página e retorna status HTTP, tamanho e um trecho do HTML
+    pra você validar no navegador. Útil pra testar bloqueios/timeouts.
     """
+    url = f"{BASE_SO_URL}?pagina={page}"
+    t0 = time.time()
     try:
-        data = fetch_sorteonline_page(page=page)
-        return JSONResponse(data)
-    except requests.HTTPError as e:
-        raise HTTPException(
-            status_code=502, detail=f"Falha HTTP ao acessar SorteOnline: {e}")
+        resp = _scraper_get(url, render=True)
+        elapsed = round(time.time() - t0, 3)
+        snippet = resp.text[:1200]
+        return JSONResponse(
+            {
+                "page": page,
+                "url": url,
+                "status_code": resp.status_code,
+                "elapsed_s": elapsed,
+                "qtd": len(resp.text),
+                "snippet": snippet,
+                "headers_used": {
+                    "User-Agent": USER_AGENT,
+                    "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
+                    "Referer": "https://www.sorteonline.com.br/",
+                },
+            }
+        )
     except requests.ReadTimeout:
         raise HTTPException(
-            status_code=504, detail="Timeout ao renderizar a página do SorteOnline (ScraperAPI).")
-    except Exception as e:
+            status_code=504, detail="Timeout renderizando página (ScraperAPI).")
+    except Exception as exc:
         raise HTTPException(
-            status_code=500, detail=f"Erro de parsing/debug: {e}")
+            status_code=502, detail=f"Erro no ScraperAPI: {exc}")
 
 
-@app.get("/lotofacil")
-def lotofacil(months: int = Query(3, ge=1)):
+@app.get("/lotofacil", summary="Resultados da Lotofácil (últimos N meses)")
+def lotofacil(months: int = Query(3, alias="months", ge=1, le=12)):
     """
-    Retorna concursos dos últimos `months` meses (aceita >12 também).
-    Observação: meses grandes podem demorar mais, pois exigem mais dados.
+    Percorre páginas do SorteOnline via ScraperAPI até cobrir 'months' meses
+    (ou até o limite de tempo da Render). Retorna concursos parseds.
     """
-    try:
-        result = get_concursos_last_months(months)
-        return JSONResponse(result)
-    except requests.HTTPError as e:
-        raise HTTPException(
-            status_code=502, detail=f"SorteOnline respondeu erro HTTP: {e}")
-    except requests.ReadTimeout:
-        raise HTTPException(
-            status_code=504, detail="Timeout ao renderizar a página do SorteOnline (ScraperAPI).")
-    except Exception as e:
-        raise HTTPException(
-            status_code=500, detail=f"Erro processando resultados: {e}")
+    deadline = time.time() + HARD_DEADLINE
+    limite_data = (datetime.utcnow() - timedelta(days=30 * months)).date()
 
+    pagina = 1
+    todos: T.List[dict] = []
 
-# --------------------------------------------------------------------
-# Execução local (debug) - o Render usa o comando do render.yaml
-# --------------------------------------------------------------------
-if __name__ == "__main__":
-    import uvicorn
+    while time.time() < deadline:
+        url = f"{BASE_SO_URL}?pagina={pagina}"
+        try:
+            resp = _scraper_get(url, render=True)
+        except requests.ReadTimeout:
+            raise HTTPException(
+                status_code=504, detail="Timeout renderizando página (ScraperAPI).")
+        except Exception as exc:
+            raise HTTPException(
+                status_code=502, detail=f"Erro no ScraperAPI: {exc}")
 
-    uvicorn.run("main:app", host="0.0.0.0", port=int(
-        os.getenv("PORT", "8900")), reload=True)
+        if resp.status_code >= 500:
+            raise HTTPException(
+                status_code=502, detail=f"SorteOnline respondeu {resp.status_code} em {url}")
+
+        # Parse
+        page_results = _parse_result_list(resp.text)
+        if not page_results:
+            # Nada encontrado nesta página -> encerra
+            break
+
+        todos.extend(page_results)
+
+        # Verifica se já cobrimos o recorte de meses
+        mais_antigo = None
+        for r in page_results:
+            if r.get("data"):
+                d = datetime.strptime(r["data"], "%Y-%m-%d").date()
+                mais_antigo = d if (mais_antigo is None or d <
+                                    mais_antigo) else mais_antigo
+        if mais_antigo and mais_antigo <= limite_data:
+            break
+
+        pagina += 1
+
+        # Breve pausa pra não parecer bot agressivo
+        time.sleep(0.8)
+
+    # Dedup / Sort final
+    uniq = {}
+    for r in todos:
+        uniq[r["concurso"]] = r
+    final = list(uniq.values())
+    final.sort(key=lambda x: x["concurso"], reverse=True)
+
+    return {"meses": months, "qtd": len(final), "concursos": final}
