@@ -1,5 +1,6 @@
-fastapi
-uvicorn
-requests
-beautifulsoup4
-python-dateutil
+fastapi==0.115.0
+uvicorn==0.30.6
+requests==2.32.3
+beautifulsoup4==4.12.3
+python-dateutil==2.9.0.post0
+apscheduler==3.11.0
