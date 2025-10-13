@@ -8,6 +8,61 @@ from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from apscheduler.schedulers.background import BackgroundScheduler
 
+# ==== ADICIONE ESSE BLOCO NO main.py (perto dos imports/constantes) ====
+
+import html
+from fastapi import HTTPException
+
+# headers mais “reais” de navegador
+STRONG_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/128.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+    "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Referer": "https://www.numeromania.com.br/",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+    "Connection": "keep-alive",
+}
+
+
+@app.get("/debug/numeromania")
+def debug_numeromania(page: int = 1):
+    """
+    Só para diagnóstico: baixa a página do Numeromania e reporta status,
+    tamanho e se achou tabela. NÃO usar em produção nem deixar público depois.
+    """
+    url = f"https://www.numeromania.com.br/estatisticas_lotofacil.asp?pagina={page}"
+    try:
+        resp = requests.get(url, headers=STRONG_HEADERS, timeout=20)
+    except Exception as e:
+        raise HTTPException(502, f"Erro de rede: {e}")
+
+    text = resp.text or ""
+    soup = BeautifulSoup(text, "html.parser")
+    tables = soup.find_all("table")
+    trs = soup.find_all("tr")
+
+    # loga no Render
+    print(
+        f"[DEBUG] numeromania page={page} status={resp.status_code} "
+        f"len={len(text)} tables={len(tables)} trs={len(trs)}"
+    )
+
+    # devolve um resumo (com início do HTML escapado)
+    return {
+        "url": url,
+        "status": resp.status_code,
+        "len": len(text),
+        "tables": len(tables),
+        "trs": len(trs),
+        "snippet": html.escape(text[:1000]),
+    }
+
+
 app = FastAPI(title="Lotofácil API", version="2.3")
 
 # -------- CORS --------
