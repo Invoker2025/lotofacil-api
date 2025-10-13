@@ -1,267 +1,56 @@
-from __future__ import annotations
-
 import os
 import re
-import json
-import time
-import logging
-from datetime import datetime, timedelta, timezone
-from typing import List, Dict, Any, Tuple
+from datetime import datetime, timedelta
+from typing import List, Dict, Any
 
 import requests
 from bs4 import BeautifulSoup
-from dateutil import parser as dtparser
+from fastapi import FastAPI, Query, HTTPException
 
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.middleware.cors import CORSMiddleware
+APP_NAME = "Lotofácil API (AS Loterias)"
+VERSION = "2.1.0"
 
-# ------------------------------------------------------------------------------
-# Configurações gerais
-# ------------------------------------------------------------------------------
-UTC = timezone.utc
-LOG = logging.getLogger("lotofacil")
-logging.basicConfig(level=logging.INFO,
-                    format="%(asctime)s [%(levelname)s] %(message)s")
+# ----- Configuração do upstream (AS Loterias) -----
+# >>> AQUI ESTAVA O PROBLEMA: deve ser 'resultado' (singular)
+BASE_URL = "https://asloterias.com.br/resultado/lotofacil"
 
-# Caminho correto (plural):
-AS_BASE = "https://asloterias.com.br/resultados/lotofacil"
-
-# Cabeçalhos para parecer navegação de browser
-DEFAULT_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
-    "Connection": "keep-alive",
-    "Referer": "https://asloterias.com.br/",
-}
-
-SESSION = requests.Session()
-SESSION.headers.update(DEFAULT_HEADERS)
-SESSION.timeout = 25  # segundos
-
-# ------------------------------------------------------------------------------
-# App
-# ------------------------------------------------------------------------------
-app = FastAPI(title="Lotofácil API (AS Loterias)", version="2.0.0")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# ------------------------------------------------------------------------------
-# Utilidades de parsing
-# ------------------------------------------------------------------------------
-
-_CONCURSO_RE = re.compile(r"(concurso|conc\.)\s*#?\s*(\d+)", re.I)
-# datas como 12/10/2025
-_DATA_RE = re.compile(r"\b(\d{1,2}/\d{1,2}/\d{2,4})\b")
-# sequências de 15 números (dois dígitos ou um dígito), tolerante
-_NUMS_RE = re.compile(r"\b(\d{1,2})\b")
+# ----- ScraperAPI (opcional) -----
+SCRAPERAPI_KEY = os.getenv("SCRAPERAPI_KEY")  # defina no Render > Environment
+SCRAPERAPI_URL = "https://api.scraperapi.com"
 
 
-def _parse_date_any(text: str) -> datetime | None:
-    """Tenta encontrar uma data dd/mm/aaaa no texto, senão usa dateutil."""
-    m = _DATA_RE.search(text or "")
-    if m:
-        try:
-            return dtparser.parse(m.group(1), dayfirst=True).replace(tzinfo=UTC)
-        except Exception:
-            pass
-    try:
-        return dtparser.parse(text, dayfirst=True).replace(tzinfo=UTC)
-    except Exception:
-        return None
+def http_get(url: str, params: Dict[str, Any] | None = None, headers: Dict[str, str] | None = None) -> requests.Response:
+    """Faz GET direto ou via ScraperAPI (se a chave existir)."""
+    params = dict(params or {})
+    headers = dict(headers or {})
+
+    if SCRAPERAPI_KEY:
+        # usamos ScraperAPI
+        payload = {"api_key": SCRAPERAPI_KEY,
+                   "url": url, "keep_headers": "true"}
+        # Opcional: passar cabeçalhos de um navegador
+        headers.setdefault("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                         "AppleWebKit/537.36 (KHTML, like Gecko) "
+                                         "Chrome/128.0.0.0 Safari/537.36")
+        resp = requests.get(SCRAPERAPI_URL, params=payload,
+                            headers=headers, timeout=30)
+    else:
+        # requisição direta
+        headers.setdefault("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                         "AppleWebKit/537.36 (KHTML, like Gecko) "
+                                         "Chrome/128.0.0.0 Safari/537.36")
+        resp = requests.get(url, params=params, headers=headers, timeout=30)
+
+    return resp
 
 
-def _extract_15_numbers(container: str) -> List[int]:
-    """
-    Extrai 15 dezenas do HTML/texto do card do concurso.
-    Estratégia: encontrarmos o bloco do card e capturarmos 15 inteiros únicos (1..25).
-    """
-    nums = [int(x) for x in _NUMS_RE.findall(container)]
-    # Mantém apenas dezenas válidas 1..25
-    nums = [n for n in nums if 1 <= n <= 25]
-    # Heurística: pega a primeira sequência de 15 valores
-    seq: List[int] = []
-    for n in nums:
-        if len(seq) < 15:
-            seq.append(n)
-        if len(seq) == 15:
-            break
-    return seq if len(seq) == 15 else []
-
-
-def _extract_card_info(card: BeautifulSoup) -> Dict[str, Any] | None:
-    """
-    Extrai {concurso, data, dezenas} de um 'card' da página.
-    A AS Loterias muda markup com alguma frequência; deixamos heurístico/tolerante.
-    """
-    raw = card.get_text(" ", strip=True) if card else ""
-    html = str(card)
-
-    # concurso
-    conc = None
-    m = _CONCURSO_RE.search(raw)
-    if m:
-        conc = int(m.group(2))
-
-    # data
-    data = _parse_date_any(raw)
-
-    # dezenas
-    dezenas = _extract_15_numbers(html)
-
-    if conc and data and dezenas:
-        return {
-            "concurso": conc,
-            "data": data.date().isoformat(),
-            "dezenas": dezenas,
-        }
-    return None
-
-
-def _page_url(page: int) -> str:
-    # a AS Loterias pagina por querystring ?pagina=N em alguns sites; aqui testamos
-    # dois formatos conhecidos: /resultados/lotofacil e com ?page=N.
-    return AS_BASE if page == 1 else f"{AS_BASE}?page={page}"
-
-
-def _fetch_page(page: int) -> Tuple[int, str]:
-    url = _page_url(page)
-    LOG.info(f"[AS] GET {url}")
-    r = SESSION.get(url)
-    return r.status_code, r.text
-
-
-def _parse_list_page(html: str) -> List[Dict[str, Any]]:
-    """
-    Varre a página e tenta localizar 'cards' de resultados.
-    Padrões comuns:
-      - <article> por concurso
-      - divs com classes que incluem 'card' / 'resultado' / 'draw' etc.
-    """
-    soup = BeautifulSoup(html, "html.parser")
-
-    # 1) candidatos óbvios de cards
-    candidates = []
-    candidates += soup.select("article")
-    candidates += soup.select("div.card, div.resultado, div.result, li, section")
-
-    # remove duplicados mantendo ordem
-    seen = set()
-    uniq = []
-    for el in candidates:
-        key = id(el)
-        if key not in seen:
-            seen.add(key)
-            uniq.append(el)
-
-    results: List[Dict[str, Any]] = []
-    for el in uniq:
-        info = _extract_card_info(el)
-        if info:
-            results.append(info)
-
-    # fallback mais amplo: procurar blocos com 15 números em qualquer container
-    if not results:
-        for el in soup.find_all(True):
-            info = _extract_card_info(el)
-            if info:
-                results.append(info)
-
-    # remove duplicados de concurso
-    dedup = {}
-    for it in results:
-        dedup[it["concurso"]] = it
-    ordered = sorted(dedup.values(), key=lambda x: x["concurso"], reverse=True)
-    return ordered
-
-# ------------------------------------------------------------------------------
-# Coletor por meses (paginação até data limite)
-# ------------------------------------------------------------------------------
-
-
-def collect_lotofacil_from_as(months: int) -> Dict[str, Any]:
-    if months < 1:
-        months = 1
-
-    cutoff = (datetime.now(tz=UTC) -
-              timedelta(days=30 * months)).date().isoformat()
-    LOG.info(f"[AS] Coletando até a data (aprox) {cutoff}  (~{months} meses)")
-
-    page = 1
-    out: List[Dict[str, Any]] = []
-    older_reached = False
-    max_pages = 60  # segurança
-
-    while page <= max_pages and not older_reached:
-        status, html = _fetch_page(page)
-        if status != 200:
-            # quando 404, paramos
-            LOG.warning(f"[AS] status {status} page={page}; interrompendo.")
-            break
-
-        cards = _parse_list_page(html)
-        LOG.info(f"[AS] page={page} -> {len(cards)} cartões")
-
-        if not cards:
-            # nada encontrado nesta página; paramos
-            break
-
-        for c in cards:
-            out.append(c)
-            if c["data"] <= cutoff:
-                older_reached = True
-
-        page += 1
-        # evita ser agressivo
-        time.sleep(0.6)
-
-    # filtra por cutoff e ordena do mais recente para o mais antigo
-    filtered = [c for c in out if c["data"] > cutoff]
-    filtered = sorted(filtered, key=lambda x: (
-        x["data"], x["concurso"]), reverse=True)
-
-    return {
-        "meses": months,
-        "qtd": len(filtered),
-        "concursos": filtered,
-    }
-
-
-# ------------------------------------------------------------------------------
-# Cache simples
-# ------------------------------------------------------------------------------
-CACHE: Dict[int, Dict[str, Any]] = {}
-
-
-def warm_cache():
-    for m in [1, 2, 3, 4, 5, 6, 12]:
-        try:
-            CACHE[m] = collect_lotofacil_from_as(m)
-            LOG.info(
-                f"[CACHE] Atualizado para {m}m: {CACHE[m]['qtd']} concursos")
-        except Exception as e:
-            LOG.exception(f"[CACHE] Falha ao atualizar {m}m: {e}")
-
-# ------------------------------------------------------------------------------
-# Rotas
-# ------------------------------------------------------------------------------
+# ----- FastAPI -----
+app = FastAPI(title=APP_NAME, version=VERSION)
 
 
 @app.get("/")
 def root():
-    return {
-        "ok": True,
-        "message": "Lotofácil API online. Use /health ou /lotofacil?months=3",
-        "docs": "/docs",
-    }
+    return {"ok": True, "message": "Lotofácil API online. Use /health ou /lotofacil?months=3", "docs": "/docs"}
 
 
 @app.get("/health")
@@ -271,53 +60,128 @@ def health():
 
 @app.get("/debug")
 def debug(page: int = Query(1, ge=1)):
-    """Baixa 1 página e mostra um sample básico para validar scraping."""
-    status, html = _fetch_page(page)
-    if status != 200:
-        return {"page": page, "url": _page_url(page), "status_code": status, "qtd": 0, "sample": []}
-    parsed = _parse_list_page(html)
+    """
+    Baixa a página pedida do AS Loterias e retorna status + pequena amostra.
+    Útil para checar se a ScraperAPI está funcionando (status_code deve ser 200).
+    """
+    url = BASE_URL
+    if page > 1:
+        # AS Loterias usa paginação adicionada após a URL com ?page=N
+        url = f"{BASE_URL}?page={page}"
+
+    resp = http_get(url)
+    sample = []
+    if resp.status_code == 200:
+        # devolve só os 200 primeiros caracteres de HTML para conferência
+        snippet = resp.text[:200]
+        sample.append(snippet)
+
     return {
         "page": page,
-        "url": _page_url(page),
-        "status_code": status,
-        "qtd": len(parsed),
-        "sample": parsed[:2],
+        "url": url,
+        "status_code": resp.status_code,
+        "qtd": len(sample),
+        "sample": sample
     }
+
+
+# ----------------- PARSER -----------------
+date_re = re.compile(r"(\d{2}/\d{2}/\d{4})")
+num_re = re.compile(r"\b\d{2}\b")
+
+
+def parse_draws_from_html(html: str) -> List[Dict[str, Any]]:
+    """
+    Tenta extrair sorteios da página do AS Loterias.
+    Estratégia robusta: procurar blocos com data e 15 números (dois dígitos).
+    """
+    soup = BeautifulSoup(html, "html.parser")
+
+    # Heurística: cada sorteio costuma estar em um card/box; vamos olhar por seções/divs
+    blocks = soup.find_all(["section", "article", "div"])
+    results: List[Dict[str, Any]] = []
+
+    for b in blocks:
+        text = " ".join(b.stripped_strings)
+        if not text:
+            continue
+
+        # Procura uma data dentro do bloco
+        dmatch = date_re.search(text)
+        if not dmatch:
+            continue
+        date_str = dmatch.group(1)
+
+        # Procura números de dois dígitos dentro do bloco
+        nums = num_re.findall(text)
+        # Heurística: sorteio da Lotofácil tem 15 dezenas; pegamos a primeira sequência de 15
+        if len(nums) >= 15:
+            # Filtra só os 15 primeiros (para não pegar extras de outros textos)
+            dezenas = list(map(int, nums[:15]))
+            results.append({
+                "data": date_str,
+                "dezenas": dezenas
+            })
+
+    return results
+
+
+def load_months(months: int) -> List[Dict[str, Any]]:
+    """
+    Percorre as páginas do AS Loterias até cobrir o intervalo de 'months'
+    (ou até acabarem os resultados).
+    """
+    since = datetime.today() - timedelta(days=30 * months)
+    page = 1
+    found: List[Dict[str, Any]] = []
+
+    while True:
+        url = BASE_URL if page == 1 else f"{BASE_URL}?page={page}"
+        resp = http_get(url)
+
+        # Se der 403/404 etc, paramos
+        if resp.status_code != 200:
+            break
+
+        draws = parse_draws_from_html(resp.text)
+        if not draws:
+            break  # nada reconhecido nessa página
+
+        # Coleta apenas os dentro do intervalo
+        added_this_page = 0
+        for d in draws:
+            try:
+                ddate = datetime.strptime(d["data"], "%d/%m/%Y")
+            except Exception:
+                continue
+            if ddate >= since:
+                found.append(d)
+                added_this_page += 1
+
+        # Se não adicionou nada nessa página, provavelmente já passou do limite
+        if added_this_page == 0:
+            break
+
+        page += 1
+        if page > 50:  # trava de segurança
+            break
+
+    return found
 
 
 @app.get("/lotofacil")
 def lotofacil(months: int = Query(3, ge=1)):
-    # cache rápido
-    if months in CACHE and CACHE[months].get("qtd", 0) > 0:
-        return CACHE[months]
+    """
+    Retorna todos os concursos dos últimos 'months' meses (extraídos do AS Loterias).
+    """
     try:
-        data = collect_lotofacil_from_as(months)
-        # guarda no cache só se tiver algo
-        if data.get("qtd", 0) > 0:
-            CACHE[months] = data
-        return data
+        data = load_months(months)
     except Exception as e:
-        LOG.exception("Erro coletando AS Loterias")
-        raise HTTPException(status_code=502, detail=str(e))
+        raise HTTPException(
+            status_code=502, detail=f"Falha ao coletar dados: {e}")
 
-# ------------------------------------------------------------------------------
-# Startup: aquece o cache
-# ------------------------------------------------------------------------------
-
-
-@app.on_event("startup")
-def on_startup():
-    LOG.info("Iniciando app; aquecendo cache…")
-    try:
-        warm_cache()
-    except Exception:
-        LOG.exception("Falha no warm_cache()")
-
-
-# ------------------------------------------------------------------------------
-# Exec local
-# ------------------------------------------------------------------------------
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.getenv("PORT", "8900"))
-    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=True)
+    return {
+        "meses": months,
+        "qtd": len(data),
+        "concursos": data
+    }
