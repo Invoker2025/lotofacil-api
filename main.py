@@ -16,12 +16,6 @@ app = FastAPI(title=APP_NAME, version="2.1.0")
 
 # --------- util: chamada via ScraperAPI ----------
 def fetch_via_scraper(url: str, render: bool = True, raise_for_status: bool = False):
-    """
-    Busca a URL informada passando pelo ScraperAPI.
-    - render=True: usa navegador headless (para páginas com JS)
-    - raise_for_status: se True, lança requests.HTTPError em 4xx/5xx
-    Retorna (status_code, text, headers_used)
-    """
     if not SCRAPER_KEY:
         return 500, "", {"error": "SCRAPERAPI_KEY ausente nas variáveis de ambiente"}
 
@@ -35,20 +29,22 @@ def fetch_via_scraper(url: str, render: bool = True, raise_for_status: bool = Fa
     if render:
         params["render"] = "true"
 
-    # cabeçalhos "normais" de um navegador
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                       "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
         "Accept-Language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
         "Referer": "https://www.asloterias.com.br/",
-        "Connection": "keep-alive",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     }
 
-    res = requests.get(api, params=params, headers=headers, timeout=60)
-    if raise_for_status:
-        res.raise_for_status()
-    return res.status_code, res.text, {"headers_used": headers}
+    try:
+        res = requests.get(api, params=params, headers=headers, timeout=60)
+        if raise_for_status:
+            res.raise_for_status()
+        return res.status_code, res.text, {"headers_used": headers}
+    except requests.exceptions.ReadTimeout:
+        return 504, "", {"error": "ScraperAPI timeout após 60s"}
+    except Exception as e:
+        return 500, "", {"error": f"Falha na ScraperAPI: {e}"}
 
 
 # --------- parser p/ AS Loterias (versão defensiva) ----------
