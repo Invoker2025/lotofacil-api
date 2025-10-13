@@ -53,13 +53,11 @@ def _scraper_get(url: str, *, render: bool = True, retries: int = 4, backoff: fl
     params = {
         "api_key": SCRAPER_KEY,
         "url": url,
-        "render": "true" if render else "false",
+        "render": "true",
         "country_code": "br",
         "keep_headers": "true",
-        # Sites bem protegidos às vezes exigem premium/ultra; habilite se necessário:
-        # "premium": "true",
-        # "ultra_premium": "true",
-        # aumentar timeout do lado do ScraperAPI (em ms). default ~30s lá.
+        "premium": "true",        # <- ativa renderização JS completa
+        "ultra_premium": "true",  # <- se seu plano permitir, garante bypass Cloudflare
         "timeout": str(60000),
     }
 
