@@ -6,16 +6,17 @@ import json
 import re
 import time
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional
 
 from fastapi import FastAPI, Query, Response
 from fastapi.responses import JSONResponse, PlainTextResponse, HTMLResponse
 from playwright.async_api import async_playwright, TimeoutError as PWTimeoutError
 
+# bs4 é opcional; se não estiver instalado, caímos no parser por regex
 try:
     from bs4 import BeautifulSoup  # type: ignore
 except Exception:
-    BeautifulSoup = None  # fallback se bs4 não estiver instalado
+    BeautifulSoup = None  # type: ignore
 
 APP_NAME = "Lotofacil API"
 APP_VERSION = "4.0.0"
@@ -61,7 +62,7 @@ async def fetch_html(force: bool = False, retries: int = 2, timeout_ms: int = 50
     if not force and _cache["html"] and (now - _cache["ts"] < CACHE_TTL_SECONDS):
         return _cache["html"]
     last_exc: Optional[Exception] = None
-    for attempt in range(1, retries + 1):
+    for _ in range(retries):
         try:
             html = await render_page(DEFAULT_URL, timeout_ms=timeout_ms)
             _cache["html"] = html
@@ -285,7 +286,6 @@ def suggest_combo(freq_list: List[Dict[str, Any]], hi: int = 12, lo: int = 3) ->
     """Escolhe 12 mais frequentes + 3 menos frequentes (entre os restantes)."""
     hi = max(0, min(15, hi))
     lo = max(0, min(15 - hi, lo))
-    # ordenações
     by_count_desc = sorted(freq_list, key=lambda x: (-x["count"], x["n"]))
     top_hi = [x["n"] for x in by_count_desc[:hi]]
 
@@ -377,7 +377,6 @@ async def lotofacil(
         if max_even is not None:
             items = [x for x in items if x["even_count"] <= max_even]
 
-        # resumo
         hist: Dict[str, int] = {}
         total_even = total_odd = 0
         for x in items:
@@ -456,47 +455,47 @@ async def not_found(_, __):
 @app.get("/app", response_class=HTMLResponse)
 async def app_page():
     # Página única: UI moderna (dark), sem libs externas
-    return f"""<!doctype html>
+    html = r"""<!doctype html>
 <html lang="pt-BR">
 <head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Lotofácil • 12 mais / 3 menos</title>
 <style>
-:root {{
+:root {
   --bg:#0b1020; --card:#0f172a; --muted:#93a4bd; --fg:#e5eaf1; --soft:#101a33;
   --green:#22c55e; --red:#ef4444; --acc:#38bdf8; --border:#1f2b46;
-}}
-*{{box-sizing:border-box}}
-body{{margin:0;background:linear-gradient(180deg,#0b1020,#0b1020);color:var(--fg);
-     font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Arial,sans-serif}}
-header{{padding:18px 16px;border-bottom:1px solid var(--border);
-       position:sticky;top:0;background:rgba(11,16,32,.9);backdrop-filter:blur(8px)}}
-h1{{margin:0;font-size:18px;letter-spacing:.2px}}
-main{{max-width:980px;margin:0 auto;padding:16px}}
-.card{{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:16px;margin:12px 0}}
-.row{{display:flex;gap:12px;flex-wrap:wrap}}
-.control label{{font-size:12px;color:var(--muted)}}
-input,select{{background:var(--soft);color:var(--fg);border:1px solid var(--border);
-             border-radius:10px;padding:10px 12px;outline:none}}
-button{{background:var(--acc);color:#001a24;border:0;border-radius:10px;
-      padding:10px 16px;font-weight:700;cursor:pointer}}
-button:disabled{{opacity:.7;cursor:wait}}
-small.muted{{color:var(--muted)}}
-.grid15{{display:grid;grid-template-columns:repeat(5,1fr);gap:14px;margin-top:10px}}
-.ball{{width:72px;height:72px;border-radius:50%;display:flex;align-items:center;
-      justify-content:center;font-weight:800;font-variant-numeric:tabular-nums;box-shadow:0 8px 24px #0004}}
-.ball.green{{background:radial-gradient(ellipse at 30% 30%,#40e07a,#1f9d4d)}}
-.ball.red{{background:radial-gradient(ellipse at 30% 30%,#ff7575,#c53434)}}
-.barwrap{{display:grid;grid-template-columns:repeat(25,1fr);gap:10px;align-items:end;margin-top:14px}}
-.bar{{background:linear-gradient(180deg,#89c4ff,#2a66ff);border-radius:9px 9px 4px 4px;position:relative}}
-.bar span{{position:absolute;bottom:calc(100% + 6px);left:50%;transform:translateX(-50%);
-          color:var(--muted);font-size:11px}}
-.bar label{{position:absolute;top:100%;left:50%;transform:translate(-50%,6px);color:var(--muted);font-size:12px}}
-.table{{width:100%;border-collapse:collapse}}
-.table th,.table td{{border-bottom:1px solid var(--border);padding:10px;text-align:left;vertical-align:top}}
-.badge{{display:inline-block;background:#0a1226;border:1px solid var(--border);padding:4px 8px;border-radius:999px;font-size:12px;margin-right:6px}}
-.footer{{text-align:center;color:var(--muted);padding:16px}}
-@media (max-width:720px){{.grid15 .ball{{width:60px;height:60px}} .barwrap{{gap:8px}}}}
+}
+*{box-sizing:border-box}
+body{margin:0;background:linear-gradient(180deg,#0b1020,#0b1020);color:var(--fg);
+     font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Arial,sans-serif}
+header{padding:18px 16px;border-bottom:1px solid var(--border);
+       position:sticky;top:0;background:rgba(11,16,32,.9);backdrop-filter:blur(8px)}
+h1{margin:0;font-size:18px;letter-spacing:.2px}
+main{max-width:980px;margin:0 auto;padding:16px}
+.card{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:16px;margin:12px 0}
+.row{display:flex;gap:12px;flex-wrap:wrap}
+.control label{font-size:12px;color:var(--muted)}
+input,select{background:var(--soft);color:var(--fg);border:1px solid var(--border);
+             border-radius:10px;padding:10px 12px;outline:none}
+button{background:var(--acc);color:#001a24;border:0;border-radius:10px;
+      padding:10px 16px;font-weight:700;cursor:pointer}
+button:disabled{opacity:.7;cursor:wait}
+small.muted{color:var(--muted)}
+.grid15{display:grid;grid-template-columns:repeat(5,1fr);gap:14px;margin-top:10px}
+.ball{width:72px;height:72px;border-radius:50%;display:flex;align-items:center;
+      justify-content:center;font-weight:800;font-variant-numeric:tabular-nums;box-shadow:0 8px 24px #0004}
+.ball.green{background:radial-gradient(ellipse at 30% 30%,#40e07a,#1f9d4d)}
+.ball.red{background:radial-gradient(ellipse at 30% 30%,#ff7575,#c53434)}
+.barwrap{display:grid;grid-template-columns:repeat(25,1fr);gap:10px;align-items:end;margin-top:14px}
+.bar{background:linear-gradient(180deg,#89c4ff,#2a66ff);border-radius:9px 9px 4px 4px;position:relative}
+.bar span{position:absolute;bottom:calc(100% + 6px);left:50%;transform:translateX(-50%);
+          color:var(--muted);font-size:11px}
+.bar label{position:absolute;top:100%;left:50%;transform:translate(-50%,6px);color:var(--muted);font-size:12px}
+.table{width:100%;border-collapse:collapse}
+.table th,.table td{border-bottom:1px solid var(--border);padding:10px;text-align:left;vertical-align:top}
+.badge{display:inline-block;background:#0a1226;border:1px solid var(--border);padding:4px 8px;border-radius:999px;font-size:12px;margin-right:6px}
+.footer{text-align:center;color:var(--muted);padding:16px}
+@media (max-width:720px){.grid15 .ball{width:60px;height:60px} .barwrap{gap:8px}}
 </style>
 </head>
 <body>
@@ -543,7 +542,7 @@ small.muted{{color:var(--muted)}}
     </table>
   </div>
 
-  <div class="footer">Fonte: Sorte Online • API pessoal • v{APP_VERSION}</div>
+  <div class="footer">Fonte: Sorte Online • API pessoal • v__VER__</div>
 </main>
 
 <script>
@@ -569,18 +568,16 @@ function renderCombo(s){
   const el = document.getElementById('combo'); el.innerHTML='';
   const hiSet = new Set(s.suggestion.hi); const loSet = new Set(s.suggestion.lo);
   const sorted = s.suggestion.combo;
-  // Mostra somente as 15 dezenas sugeridas (verdes/12 e vermelhas/3)
   sorted.forEach(n=>{
     const d = document.createElement('div');
     d.className = 'ball '+(hiSet.has(n)?'green':'red');
     d.textContent = fmt2(n);
     el.appendChild(d);
   });
-  const meta = document.getElementById('subtitle');
-  meta.textContent = `últimos ${s.limit} concursos • jogos considerados: ${s.considered_games}`;
-  const badge = document.getElementById('parityBadge');
+  document.getElementById('subtitle').textContent =
+    `últimos ${s.limit} concursos • jogos considerados: ${s.considered_games}`;
   const pi = s.suggestion.parity;
-  badge.textContent = `${pi.pattern} (pares/ímpares)`;
+  document.getElementById('parityBadge').textContent = `${pi.pattern} (pares/ímpares)`;
 }
 
 function renderBars(s){
@@ -618,8 +615,8 @@ async function load(){
     renderCombo(s); renderBars(s);
     const l = await fetchJSON(urlLotofacil());
     renderTable(l);
-    const meta = document.getElementById('meta');
-    meta.textContent = `Método: ${s.method} • Cache: ${s.cache_age_seconds ?? 0}s • Atualizado: ${s.updated_at}`;
+    document.getElementById('meta').textContent =
+      `Método: ${s.method} • Cache: ${s.cache_age_seconds ?? 0}s • Atualizado: ${s.updated_at}`;
   }catch(e){
     alert('Erro: '+(e.message||e));
   }finally{ btn.disabled = false; }
@@ -630,3 +627,4 @@ window.addEventListener('load', load);
 </script>
 </body></html>
 """
+    return HTMLResponse(html.replace("__VER__", APP_VERSION))
