@@ -1,6 +1,8 @@
 # main.py
-# Lotofácil API — FastAPI + Playwright + Parser + Paridade + Estatísticas + UI
-# v4.0.0
+# Lotofacil API — FastAPI + Playwright + UI
+# v4.2.0
+
+from __future__ import annotations
 
 import json
 import re
@@ -12,68 +14,20 @@ from fastapi import FastAPI, Query, Response
 from fastapi.responses import JSONResponse, PlainTextResponse, HTMLResponse
 from playwright.async_api import async_playwright, TimeoutError as PWTimeoutError
 
-# bs4 é opcional; se não estiver instalado, caímos no parser por regex
+# --- BeautifulSoup opcional (parser principal usa JSON do Next.js) ---
 try:
     from bs4 import BeautifulSoup  # type: ignore
 except Exception:
     BeautifulSoup = None  # type: ignore
 
 APP_NAME = "Lotofacil API"
-APP_VERSION = "4.0.0"
+APP_VERSION = "4.2.0"
 DEFAULT_URL = "https://www.sorteonline.com.br/lotofacil/resultados"
 
-# Cache curto (para reduzir chamadas ao site)
+# --------------------- Cache por-URL (reduz re-scrape) ---------------------
 CACHE_TTL_SECONDS = 120
-_cache: Dict[str, Any] = {"ts": 0.0, "html": None}
-
-app = FastAPI(
-    title=APP_NAME,
-    version=APP_VERSION,
-    summary="Resultados da Lotofácil via Playwright com UI e estatísticas",
-    docs_url="/docs",
-    redoc_url=None,
-)
-
-# --------------------- Playwright helpers ---------------------
-
-
-async def render_page(url: str, timeout_ms: int = 45_000) -> str:
-    """Abre Chromium headless, acessa a URL e retorna o HTML."""
-    launch_args = [
-        "--no-sandbox",
-        "--disable-dev-shm-usage",
-        "--disable-gpu",
-        "--disable-setuid-sandbox",
-    ]
-    async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=True, args=launch_args)
-        try:
-            context = await browser.new_context()
-            page = await context.new_page()
-            await page.goto(url, timeout=timeout_ms, wait_until="domcontentloaded")
-            html = await page.content()
-            return html
-        finally:
-            await browser.close()
-
-
-async def fetch_html(force: bool = False, retries: int = 2, timeout_ms: int = 50_000) -> str:
-    now = time.time()
-    if not force and _cache["html"] and (now - _cache["ts"] < CACHE_TTL_SECONDS):
-        return _cache["html"]
-    last_exc: Optional[Exception] = None
-    for _ in range(retries):
-        try:
-            html = await render_page(DEFAULT_URL, timeout_ms=timeout_ms)
-            _cache["html"] = html
-            _cache["ts"] = time.time()
-            return html
-        except Exception as e:
-            last_exc = e
-            time.sleep(0.8)
-    raise last_exc or RuntimeError("Falha ao baixar HTML")
-
-# --------------------- Parser helpers -----------------------
+# Ex.: _cache["https://.../resultados?page=2"] = {"ts": <epoch>, "html": "..."}
+_cache: Dict[str, Dict[str, Any]] = {}
 
 
 def _to_int(x: Any) -> Optional[int]:
@@ -86,6 +40,46 @@ def _to_int(x: Any) -> Optional[int]:
         return None
 
 
+# --------------------- Navegação com Playwright ---------------------
+async def render_page(url: str, timeout_ms: int = 45_000) -> str:
+    launch_args = [
+        "--no-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+        "--disable-setuid-sandbox",
+    ]
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=True, args=launch_args)
+        try:
+            ctx = await browser.new_context()
+            page = await ctx.new_page()
+            await page.goto(url, timeout=timeout_ms, wait_until="domcontentloaded")
+            return await page.content()
+        finally:
+            await browser.close()
+
+
+async def fetch_html_page(
+    page: int = 1, *, force: bool = False, retries: int = 2, timeout_ms: int = 50_000
+) -> str:
+    url = DEFAULT_URL if page <= 1 else f"{DEFAULT_URL}?page={page}"
+    now = time.time()
+    ent = _cache.get(url)
+    if not force and ent and (now - ent["ts"] < CACHE_TTL_SECONDS):
+        return ent["html"]
+    last: Optional[Exception] = None
+    for _ in range(retries):
+        try:
+            html = await render_page(url, timeout_ms=timeout_ms)
+            _cache[url] = {"ts": time.time(), "html": html}
+            return html
+        except Exception as e:
+            last = e
+            time.sleep(0.8)
+    raise last or RuntimeError("Falha ao baixar HTML")
+
+
+# --------------------- Helpers de parsing ---------------------
 def _normalize_numbers(v: Any) -> Optional[List[int]]:
     if not isinstance(v, (list, tuple)):
         return None
@@ -118,7 +112,7 @@ def _pick_first(d: Dict[str, Any], keys_like: Iterable[str]) -> Optional[Any]:
     return None
 
 
-def parse_from_next_data(html: str, limit: int = 10) -> List[Dict[str, Any]]:
+def parse_from_next_data(html: str, limit: int = 50) -> List[Dict[str, Any]]:
     if BeautifulSoup is None:
         return []
     soup = BeautifulSoup(html, "html.parser")
@@ -179,7 +173,6 @@ def parse_from_next_data(html: str, limit: int = 10) -> List[Dict[str, Any]]:
                 "source": "next_data",
             }
         )
-
         if len(results) >= limit:
             break
 
@@ -188,7 +181,7 @@ def parse_from_next_data(html: str, limit: int = 10) -> List[Dict[str, Any]]:
     return results[:limit]
 
 
-def parse_from_html_regex(html: str, limit: int = 10) -> List[Dict[str, Any]]:
+def parse_from_html_regex(html: str, limit: int = 50) -> List[Dict[str, Any]]:
     results: List[Dict[str, Any]] = []
     dezena = r"(?:0?[1-9]|1\d|2[0-5])"
     sep = r"(?:\s*[,|/•\-]?\s*|</[^>]+>\s*<[^>]+>)"
@@ -241,7 +234,7 @@ def parse_from_html_regex(html: str, limit: int = 10) -> List[Dict[str, Any]]:
     return uniq[:limit]
 
 
-def parse_lotofacil(html: str, limit: int = 10) -> Dict[str, Any]:
+def parse_lotofacil(html: str, limit: int = 50) -> Dict[str, Any]:
     data = parse_from_next_data(html, limit=limit)
     method = "next_data"
     if not data:
@@ -249,9 +242,36 @@ def parse_lotofacil(html: str, limit: int = 10) -> Dict[str, Any]:
         method = "regex_html"
     return {"count": len(data), "method": method, "results": data}
 
-# ---------------------- Paridade ----------------------
+
+# --------------- Agregador de páginas (?page=1..N) ----------------
+async def collect_results(limit: int, *, force: bool = False, max_pages: int = 20) -> Dict[str, Any]:
+    """Percorre ?page=1..N agregando concursos até atingir 'limit'."""
+    page = 1
+    seen: set = set()
+    agg: List[Dict[str, Any]] = []
+    method_used: Optional[str] = None
+
+    while len(agg) < limit and page <= max_pages:
+        html = await fetch_html_page(page=page, force=(force and page == 1))
+        parsed = parse_lotofacil(html, limit=200)
+        if parsed["results"]:
+            method_used = parsed["method"]
+        for r in parsed["results"]:
+            key = r.get("contest") or tuple(r["numbers"])
+            if key in seen:
+                continue
+            seen.add(key)
+            agg.append(r)
+            if len(agg) >= limit:
+                break
+        if parsed["count"] == 0:
+            break
+        page += 1
+
+    return {"results": agg[:limit], "method": method_used or "unknown"}
 
 
+# ---------------------- Paridade & Estatísticas ----------------------
 def parity_info(nums: List[int]) -> Dict[str, Any]:
     even = [n for n in nums if n % 2 == 0]
     odd = [n for n in nums if n % 2 != 0]
@@ -263,29 +283,32 @@ def parity_info(nums: List[int]) -> Dict[str, Any]:
         "pattern": f"{len(even)}-{len(odd)}",
     }
 
-# ---------------------- Estatísticas ----------------------
-
 
 def frequencies(results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Frequência de 1..25 nos resultados."""
     freq = {i: 0 for i in range(1, 26)}
     for r in results:
         for n in r["numbers"]:
             if 1 <= n <= 25:
                 freq[n] += 1
-    total_draws = len(results)
+    total = max(1, len(results))
     out = []
     for n in range(1, 26):
         c = freq[n]
-        pct = (c / total_draws * 100.0) if total_draws else 0.0
+        pct = (c / total * 100.0)
         out.append({"n": n, "count": c, "pct": round(pct, 2)})
     return out
 
 
-def suggest_combo(freq_list: List[Dict[str, Any]], hi: int = 12, lo: int = 3) -> Dict[str, Any]:
-    """Escolhe 12 mais frequentes + 3 menos frequentes (entre os restantes)."""
-    hi = max(0, min(15, hi))
-    lo = max(0, min(15 - hi, lo))
+def clamp(val: int, lo: int, hi: int) -> int:
+    return max(lo, min(hi, val))
+
+
+def suggest_combo(freq_list: List[Dict[str, Any]], hi: int = 12, lo_: int = 3) -> Dict[str, Any]:
+    # Ajustes para evitar 422/valores fora de faixa
+    hi = clamp(hi, 0, 15)
+    max_lo = 15 - hi
+    lo = clamp(lo_, 0, max_lo)
+
     by_count_desc = sorted(freq_list, key=lambda x: (-x["count"], x["n"]))
     top_hi = [x["n"] for x in by_count_desc[:hi]]
 
@@ -297,7 +320,15 @@ def suggest_combo(freq_list: List[Dict[str, Any]], hi: int = 12, lo: int = 3) ->
     info = parity_info(combo)
     return {"hi": sorted(top_hi), "lo": sorted(low_lo), "combo": combo, "parity": info}
 
-# ------------------------- Rotas API --------------------------
+
+# ---------------------------- FastAPI ----------------------------
+app = FastAPI(
+    title=APP_NAME,
+    version=APP_VERSION,
+    summary="Resultados da Lotofácil com scraping + estatísticas + UI",
+    docs_url="/docs",
+    redoc_url=None,
+)
 
 
 @app.get("/", response_class=JSONResponse)
@@ -308,7 +339,7 @@ async def root():
         "docs": "/docs",
         "health": "/health",
         "ready": "/ready",
-        "examples": {"app": "/app", "lotofacil": "/lotofacil?limit=10", "stats": "/stats?limit=50&hi=12&lo=3"},
+        "examples": {"app": "/app", "stats": "/stats?limit=60&hi=12&lo=3", "lotofacil": "/lotofacil?limit=30"},
     }
 
 
@@ -340,7 +371,7 @@ async def ready_check():
 @app.get("/debug", response_class=JSONResponse)
 async def debug():
     try:
-        html = await fetch_html(force=True, retries=2, timeout_ms=45_000)
+        html = await fetch_html_page(page=1, force=True, retries=2, timeout_ms=45_000)
         return {"len": len(html), "snippet": html[:600].replace("\n", " ")}
     except PWTimeoutError as e:
         return JSONResponse(status_code=504, content={"detail": f"Timeout no debug: {str(e)}"})
@@ -348,22 +379,19 @@ async def debug():
         return JSONResponse(status_code=502, content={"detail": f"Erro no debug: {type(e).__name__}: {str(e)}"})
 
 
+# ----------------------- /lotofacil (lista) -----------------------
 @app.get("/lotofacil", response_class=JSONResponse)
 async def lotofacil(
-    limit: int = Query(default=10, ge=1, le=50),
+    limit: int = Query(default=30, ge=1, le=200),
     pattern: Optional[str] = Query(default=None, pattern=r"^\d{1,2}-\d{1,2}$"),
     min_even: Optional[int] = Query(default=None, ge=0, le=15),
     max_even: Optional[int] = Query(default=None, ge=0, le=15),
     force: bool = Query(default=False),
 ):
-    """Lista os últimos concursos (com paridade e filtros)."""
     try:
-        html = await fetch_html(force=force, retries=2, timeout_ms=60_000)
-        parsed = parse_lotofacil(html, limit=limit)
-
-        items = []
-        for r in parsed["results"]:
-            items.append({**r, **parity_info(r["numbers"])})
+        agg = await collect_results(limit=limit, force=force)
+        res = agg["results"]
+        items = [{**r, **parity_info(r["numbers"])} for r in res]
 
         if pattern:
             try:
@@ -377,18 +405,16 @@ async def lotofacil(
         if max_even is not None:
             items = [x for x in items if x["even_count"] <= max_even]
 
+        # sumário simples
         hist: Dict[str, int] = {}
-        total_even = total_odd = 0
+        te = to = 0
         for x in items:
             hist[x["pattern"]] = hist.get(x["pattern"], 0) + 1
-            total_even += x["even_count"]
-            total_odd += x["odd_count"]
+            te += x["even_count"]
+            to += x["odd_count"]
         n = max(1, len(items))
-        summary = {
-            "histogram": dict(sorted(hist.items(), key=lambda kv: (-kv[1], kv[0]))),
-            "avg_even": round(total_even / n, 2),
-            "avg_odd": round(total_odd / n, 2),
-        }
+        summary = {"histogram": dict(sorted(hist.items(), key=lambda kv: (-kv[1], kv[0]))),
+                   "avg_even": round(te / n, 2), "avg_odd": round(to / n, 2)}
 
         return {
             "ok": True,
@@ -396,34 +422,29 @@ async def lotofacil(
             "limit": limit,
             "summary": summary,
             "results": items,
-            "method": parsed["method"],
+            "method": agg["method"],
             "source_url": DEFAULT_URL,
-            "cache_age_seconds": round(time.time() - _cache["ts"], 2) if _cache["html"] else None,
+            "cache_age_seconds": None,
         }
-
     except PWTimeoutError as e:
         return JSONResponse(status_code=504, content={"detail": f"Timeout na lotofacil: {str(e)}"})
     except Exception as e:
         return JSONResponse(status_code=502, content={"detail": f"Erro na lotofacil: {type(e).__name__}: {str(e)}"})
 
 
+# ----------------------- /stats (frequências) -----------------------
 @app.get("/stats", response_class=JSONResponse)
 async def stats(
-    limit: int = Query(default=60, ge=15, le=120,
-                       description="Qtde de concursos a considerar"),
-    hi: int = Query(default=12, ge=0, le=15,
-                    description="Qtd de dezenas mais frequentes"),
-    lo: int = Query(default=3, ge=0, le=15,
-                    description="Qtd de dezenas menos frequentes (entre as restantes)"),
+    limit: int = Query(default=60, ge=1, le=200),
+    hi: int = Query(default=12, ge=0, le=15),
+    lo: int = Query(default=3, ge=0, le=15),
     force: bool = Query(default=False),
 ):
-    """Estatísticas de frequência + sugestão 12 mais / 3 menos (configurável)."""
     try:
-        html = await fetch_html(force=force, retries=2, timeout_ms=60_000)
-        parsed = parse_lotofacil(html, limit=limit)
-        res = parsed["results"]
+        agg = await collect_results(limit=limit, force=force)
+        res = agg["results"]
         freq_list = frequencies(res)
-        suggest = suggest_combo(freq_list, hi=hi, lo=lo)
+        suggestion = suggest_combo(freq_list, hi=hi, lo_=lo)
         updated = datetime.now(timezone.utc).astimezone().strftime(
             "%d/%m/%Y %H:%M:%S")
         return {
@@ -433,11 +454,11 @@ async def stats(
             "hi": hi,
             "lo": lo,
             "frequencies": freq_list,
-            "suggestion": suggest,
-            "method": parsed["method"],
+            "suggestion": suggestion,
+            "method": agg["method"],
             "updated_at": updated,
             "source_url": DEFAULT_URL,
-            "cache_age_seconds": round(time.time() - _cache["ts"], 2) if _cache["html"] else None,
+            "cache_age_seconds": None,
         }
     except PWTimeoutError as e:
         return JSONResponse(status_code=504, content={"detail": f"Timeout em /stats: {str(e)}"})
@@ -445,20 +466,20 @@ async def stats(
         return JSONResponse(status_code=502, content={"detail": f"Erro em /stats: {type(e).__name__}: {str(e)}"})
 
 
+# ------------------------ Not Found Handler ------------------------
 @app.exception_handler(404)
 async def not_found(_, __):
     return PlainTextResponse("Not Found. Veja /app, /stats, /lotofacil, /docs, /health, /ready", status_code=404)
 
-# --------------------------- UI ---------------------------
 
-
+# ------------------------------ UI ------------------------------
 @app.get("/app", response_class=HTMLResponse)
 async def app_page():
-    # Página única: UI moderna (dark), sem libs externas
     html = r"""<!doctype html>
 <html lang="pt-BR">
 <head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Lotofácil • 12 mais / 3 menos</title>
 <style>
 :root {
@@ -506,7 +527,7 @@ small.muted{color:var(--muted)}
   <div class="card">
     <div class="row">
       <div class="control"><label>Concursos (limit)</label><br>
-        <input id="limit" type="number" min="15" max="120" value="60">
+        <input id="limit" type="number" min="1" max="200" value="60">
       </div>
       <div class="control"><label>Mais (hi)</label><br>
         <input id="hi" type="number" min="0" max="15" value="12">
@@ -547,9 +568,11 @@ small.muted{color:var(--muted)}
 
 <script>
 const fmt2 = n => String(n).padStart(2,'0');
-
-async function fetchJSON(u){ const r = await fetch(u); if(!r.ok) throw new Error('HTTP '+r.status); return r.json(); }
-
+async function fetchJSON(u){
+  const r = await fetch(u);
+  if(!r.ok){ let t=''; try{ t = await r.text(); }catch{}; throw new Error('HTTP '+r.status+(t?(' - '+t):'')); }
+  return r.json();
+}
 function urlStats(){
   const p = new URLSearchParams();
   p.set('limit', document.getElementById('limit').value || '60');
@@ -563,7 +586,6 @@ function urlLotofacil(){
   p.set('limit', document.getElementById('limit').value || '60');
   return '/lotofacil?'+p.toString();
 }
-
 function renderCombo(s){
   const el = document.getElementById('combo'); el.innerHTML='';
   const hiSet = new Set(s.suggestion.hi); const loSet = new Set(s.suggestion.lo);
@@ -579,7 +601,6 @@ function renderCombo(s){
   const pi = s.suggestion.parity;
   document.getElementById('parityBadge').textContent = `${pi.pattern} (pares/ímpares)`;
 }
-
 function renderBars(s){
   const el = document.getElementById('bars'); el.innerHTML='';
   const freqs = s.frequencies.slice().sort((a,b)=>a.n-b.n);
@@ -592,7 +613,6 @@ function renderBars(s){
     el.appendChild(b);
   });
 }
-
 function renderTable(list){
   const tb = document.querySelector('#tbl tbody'); tb.innerHTML='';
   (list.results||[]).forEach(r=>{
@@ -607,21 +627,16 @@ function renderTable(list){
     tb.appendChild(tr);
   });
 }
-
 async function load(){
   const btn = document.getElementById('run'); btn.disabled = true;
   try{
-    const s = await fetchJSON(urlStats());
-    renderCombo(s); renderBars(s);
-    const l = await fetchJSON(urlLotofacil());
-    renderTable(l);
+    const s = await fetchJSON(urlStats()); renderCombo(s); renderBars(s);
+    const l = await fetchJSON(urlLotofacil()); renderTable(l);
     document.getElementById('meta').textContent =
-      `Método: ${s.method} • Cache: ${s.cache_age_seconds ?? 0}s • Atualizado: ${s.updated_at}`;
-  }catch(e){
-    alert('Erro: '+(e.message||e));
-  }finally{ btn.disabled = false; }
+      `Método: ${s.method} • Atualizado: ${s.updated_at}`;
+  }catch(e){ alert('Erro: '+(e.message||e)); }
+  finally{ btn.disabled = false; }
 }
-
 document.getElementById('run').addEventListener('click', load);
 window.addEventListener('load', load);
 </script>
