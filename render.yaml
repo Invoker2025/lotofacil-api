@@ -2,8 +2,20 @@ services:
   - type: web
     name: lotofacil-api
     env: python
+    plan: free
+    region: oregon
+    runtime: python
     buildCommand: |
-      pip install --upgrade pip
       pip install -r requirements.txt
       python -m playwright install chromium
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.6
+      # Garante que o Playwright use o cache persistente do Render
+      - key: XDG_CACHE_HOME
+        value: /opt/render/.cache
+      - key: PLAYWRIGHT_BROWSERS_PATH
+        value: /opt/render/.cache/ms-playwright
+    healthCheckPath: /health
+    autoDeploy: true
