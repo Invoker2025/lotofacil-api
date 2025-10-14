@@ -1,14 +1,15 @@
 # main.py
-# Lotofácil API — FastAPI + Playwright + Parser + Paridade + Retry + Cache curto
-# v3.2.0
+# Lotofácil API — FastAPI + Playwright + Parser + Paridade + Estatísticas + UI
+# v4.0.0
 
 import json
 import re
 import time
+from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from fastapi import FastAPI, Query, Response
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, HTMLResponse
 from playwright.async_api import async_playwright, TimeoutError as PWTimeoutError
 
 try:
@@ -17,17 +18,17 @@ except Exception:
     BeautifulSoup = None  # fallback se bs4 não estiver instalado
 
 APP_NAME = "Lotofacil API"
-APP_VERSION = "3.2.0"
+APP_VERSION = "4.0.0"
 DEFAULT_URL = "https://www.sorteonline.com.br/lotofacil/resultados"
 
-# Cache simples em memória para evitar bater no site a cada request
-CACHE_TTL_SECONDS = 120  # 2 min
+# Cache curto (para reduzir chamadas ao site)
+CACHE_TTL_SECONDS = 120
 _cache: Dict[str, Any] = {"ts": 0.0, "html": None}
 
 app = FastAPI(
     title=APP_NAME,
     version=APP_VERSION,
-    summary="Resultados da Lotofácil via Playwright",
+    summary="Resultados da Lotofácil via Playwright com UI e estatísticas",
     docs_url="/docs",
     redoc_url=None,
 )
@@ -36,10 +37,7 @@ app = FastAPI(
 
 
 async def render_page(url: str, timeout_ms: int = 45_000) -> str:
-    """
-    Abre Chromium headless, acessa a URL e retorna o HTML.
-    wait_until='domcontentloaded' é mais estável/rápido no Render Free.
-    """
+    """Abre Chromium headless, acessa a URL e retorna o HTML."""
     launch_args = [
         "--no-sandbox",
         "--disable-dev-shm-usage",
@@ -58,14 +56,12 @@ async def render_page(url: str, timeout_ms: int = 45_000) -> str:
             await browser.close()
 
 
-async def fetch_html(force: bool = False, retries: int = 2, timeout_ms: int = 45_000) -> str:
-    # cache curto
+async def fetch_html(force: bool = False, retries: int = 2, timeout_ms: int = 50_000) -> str:
     now = time.time()
     if not force and _cache["html"] and (now - _cache["ts"] < CACHE_TTL_SECONDS):
         return _cache["html"]
-
     last_exc: Optional[Exception] = None
-    for attempt in range(1, max(1, retries) + 1):
+    for attempt in range(1, retries + 1):
         try:
             html = await render_page(DEFAULT_URL, timeout_ms=timeout_ms)
             _cache["html"] = html
@@ -73,12 +69,7 @@ async def fetch_html(force: bool = False, retries: int = 2, timeout_ms: int = 45
             return html
         except Exception as e:
             last_exc = e
-            if attempt < retries:
-                # pequena espera entre tentativas (ajuda no cold start)
-                time.sleep(0.8)
-            else:
-                raise e
-    # só pra tipagem
+            time.sleep(0.8)
     raise last_exc or RuntimeError("Falha ao baixar HTML")
 
 # --------------------- Parser helpers -----------------------
@@ -145,7 +136,6 @@ def parse_from_next_data(html: str, limit: int = 10) -> List[Dict[str, Any]]:
         if not isinstance(node, dict):
             continue
 
-        # acha lista de 15 dezenas
         numbers = None
         for _, v in node.items():
             cand = _normalize_numbers(v)
@@ -155,7 +145,6 @@ def parse_from_next_data(html: str, limit: int = 10) -> List[Dict[str, Any]]:
         if not numbers:
             continue
 
-        # concurso
         contest = None
         for k, v in node.items():
             if any(x in k.lower() for x in ("concurso", "contest", "sorteio", "draw")):
@@ -164,7 +153,6 @@ def parse_from_next_data(html: str, limit: int = 10) -> List[Dict[str, Any]]:
                     contest = ci
                     break
 
-        # data
         date = None
         for k, v in node.items():
             if any(x in k.lower() for x in ("data", "date")):
@@ -201,7 +189,6 @@ def parse_from_next_data(html: str, limit: int = 10) -> List[Dict[str, Any]]:
 
 def parse_from_html_regex(html: str, limit: int = 10) -> List[Dict[str, Any]]:
     results: List[Dict[str, Any]] = []
-    # bloco de 15 dezenas
     dezena = r"(?:0?[1-9]|1\d|2[0-5])"
     sep = r"(?:\s*[,|/•\-]?\s*|</[^>]+>\s*<[^>]+>)"
     bloco = rf"({dezena}(?:{sep}{dezena}){{14}})"
@@ -222,9 +209,9 @@ def parse_from_html_regex(html: str, limit: int = 10) -> List[Dict[str, Any]]:
         if len(cand) >= 15 and all(1 <= n <= 25 for n in cand[:15]):
             cand = cand[:15]
             idx = html.find(b)
-            snippet_around = html[max(0, idx - 1200): idx + len(b) + 1200]
-            m_conc = re_concurso.search(snippet_around)
-            m_data = re_data.search(snippet_around)
+            snippet = html[max(0, idx - 1000): idx + len(b) + 1000]
+            m_conc = re_concurso.search(snippet)
+            m_data = re_data.search(snippet)
             results.append(
                 {
                     "contest": _to_int(m_conc.group(1)) if m_conc else None,
@@ -275,7 +262,42 @@ def parity_info(nums: List[int]) -> Dict[str, Any]:
         "pattern": f"{len(even)}-{len(odd)}",
     }
 
-# ------------------------- Rotas --------------------------
+# ---------------------- Estatísticas ----------------------
+
+
+def frequencies(results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Frequência de 1..25 nos resultados."""
+    freq = {i: 0 for i in range(1, 26)}
+    for r in results:
+        for n in r["numbers"]:
+            if 1 <= n <= 25:
+                freq[n] += 1
+    total_draws = len(results)
+    out = []
+    for n in range(1, 26):
+        c = freq[n]
+        pct = (c / total_draws * 100.0) if total_draws else 0.0
+        out.append({"n": n, "count": c, "pct": round(pct, 2)})
+    return out
+
+
+def suggest_combo(freq_list: List[Dict[str, Any]], hi: int = 12, lo: int = 3) -> Dict[str, Any]:
+    """Escolhe 12 mais frequentes + 3 menos frequentes (entre os restantes)."""
+    hi = max(0, min(15, hi))
+    lo = max(0, min(15 - hi, lo))
+    # ordenações
+    by_count_desc = sorted(freq_list, key=lambda x: (-x["count"], x["n"]))
+    top_hi = [x["n"] for x in by_count_desc[:hi]]
+
+    remaining = [x for x in freq_list if x["n"] not in top_hi]
+    by_count_asc = sorted(remaining, key=lambda x: (x["count"], x["n"]))
+    low_lo = [x["n"] for x in by_count_asc[:lo]]
+
+    combo = sorted(top_hi + low_lo)
+    info = parity_info(combo)
+    return {"hi": sorted(top_hi), "lo": sorted(low_lo), "combo": combo, "parity": info}
+
+# ------------------------- Rotas API --------------------------
 
 
 @app.get("/", response_class=JSONResponse)
@@ -286,7 +308,7 @@ async def root():
         "docs": "/docs",
         "health": "/health",
         "ready": "/ready",
-        "examples": {"debug": "/debug?page=1", "lotofacil": "/lotofacil?limit=10"},
+        "examples": {"app": "/app", "lotofacil": "/lotofacil?limit=10", "stats": "/stats?limit=50&hi=12&lo=3"},
     }
 
 
@@ -316,11 +338,10 @@ async def ready_check():
 
 
 @app.get("/debug", response_class=JSONResponse)
-async def debug(page: Optional[int] = Query(default=1, ge=1, le=10)):
+async def debug():
     try:
         html = await fetch_html(force=True, retries=2, timeout_ms=45_000)
-        snippet = html[:600].replace("\n", " ")
-        return {"page": page, "len": len(html), "snippet": snippet}
+        return {"len": len(html), "snippet": html[:600].replace("\n", " ")}
     except PWTimeoutError as e:
         return JSONResponse(status_code=504, content={"detail": f"Timeout no debug: {str(e)}"})
     except Exception as e:
@@ -329,32 +350,21 @@ async def debug(page: Optional[int] = Query(default=1, ge=1, le=10)):
 
 @app.get("/lotofacil", response_class=JSONResponse)
 async def lotofacil(
-    limit: int = Query(default=10, ge=1, le=50,
-                       description="Qtde de concursos para retornar (mais recentes)"),
-    # filtros de paridade
-    pattern: Optional[str] = Query(
-        default=None, pattern=r"^\d{1,2}-\d{1,2}$", description="Ex.: 8-7 (pares-ímpares)"),
+    limit: int = Query(default=10, ge=1, le=50),
+    pattern: Optional[str] = Query(default=None, pattern=r"^\d{1,2}-\d{1,2}$"),
     min_even: Optional[int] = Query(default=None, ge=0, le=15),
     max_even: Optional[int] = Query(default=None, ge=0, le=15),
-    # cache
-    force: bool = Query(
-        default=False, description="Se true, ignora cache curto e força novo scrape"),
+    force: bool = Query(default=False),
 ):
-    """
-    Renderiza a página, extrai concursos e calcula pares/ímpares.
-    Filtros opcionais: pattern=8-7, min_even/max_even. Cache curto (~2min).
-    """
+    """Lista os últimos concursos (com paridade e filtros)."""
     try:
         html = await fetch_html(force=force, retries=2, timeout_ms=60_000)
         parsed = parse_lotofacil(html, limit=limit)
 
-        # pós-processa paridade
         items = []
         for r in parsed["results"]:
-            p = parity_info(r["numbers"])
-            items.append({**r, **p})
+            items.append({**r, **parity_info(r["numbers"])})
 
-        # filtros de paridade
         if pattern:
             try:
                 want_even, want_odd = (int(x) for x in pattern.split("-"))
@@ -362,7 +372,6 @@ async def lotofacil(
                          want_even and x["odd_count"] == want_odd]
             except Exception:
                 pass
-
         if min_even is not None:
             items = [x for x in items if x["even_count"] >= min_even]
         if max_even is not None:
@@ -375,7 +384,6 @@ async def lotofacil(
             hist[x["pattern"]] = hist.get(x["pattern"], 0) + 1
             total_even += x["even_count"]
             total_odd += x["odd_count"]
-
         n = max(1, len(items))
         summary = {
             "histogram": dict(sorted(hist.items(), key=lambda kv: (-kv[1], kv[0]))),
@@ -385,13 +393,12 @@ async def lotofacil(
 
         return {
             "ok": True,
-            "limit": limit,
-            "filters": {"pattern": pattern, "min_even": min_even, "max_even": max_even, "force": force},
-            "summary": summary,
             "count": len(items),
+            "limit": limit,
+            "summary": summary,
             "results": items,
-            "source_url": DEFAULT_URL,
             "method": parsed["method"],
+            "source_url": DEFAULT_URL,
             "cache_age_seconds": round(time.time() - _cache["ts"], 2) if _cache["html"] else None,
         }
 
@@ -401,6 +408,225 @@ async def lotofacil(
         return JSONResponse(status_code=502, content={"detail": f"Erro na lotofacil: {type(e).__name__}: {str(e)}"})
 
 
+@app.get("/stats", response_class=JSONResponse)
+async def stats(
+    limit: int = Query(default=60, ge=15, le=120,
+                       description="Qtde de concursos a considerar"),
+    hi: int = Query(default=12, ge=0, le=15,
+                    description="Qtd de dezenas mais frequentes"),
+    lo: int = Query(default=3, ge=0, le=15,
+                    description="Qtd de dezenas menos frequentes (entre as restantes)"),
+    force: bool = Query(default=False),
+):
+    """Estatísticas de frequência + sugestão 12 mais / 3 menos (configurável)."""
+    try:
+        html = await fetch_html(force=force, retries=2, timeout_ms=60_000)
+        parsed = parse_lotofacil(html, limit=limit)
+        res = parsed["results"]
+        freq_list = frequencies(res)
+        suggest = suggest_combo(freq_list, hi=hi, lo=lo)
+        updated = datetime.now(timezone.utc).astimezone().strftime(
+            "%d/%m/%Y %H:%M:%S")
+        return {
+            "ok": True,
+            "considered_games": len(res),
+            "limit": limit,
+            "hi": hi,
+            "lo": lo,
+            "frequencies": freq_list,
+            "suggestion": suggest,
+            "method": parsed["method"],
+            "updated_at": updated,
+            "source_url": DEFAULT_URL,
+            "cache_age_seconds": round(time.time() - _cache["ts"], 2) if _cache["html"] else None,
+        }
+    except PWTimeoutError as e:
+        return JSONResponse(status_code=504, content={"detail": f"Timeout em /stats: {str(e)}"})
+    except Exception as e:
+        return JSONResponse(status_code=502, content={"detail": f"Erro em /stats: {type(e).__name__}: {str(e)}"})
+
+
 @app.exception_handler(404)
 async def not_found(_, __):
-    return PlainTextResponse("Not Found. Veja /, /docs, /health, /ready, /debug ou /lotofacil", status_code=404)
+    return PlainTextResponse("Not Found. Veja /app, /stats, /lotofacil, /docs, /health, /ready", status_code=404)
+
+# --------------------------- UI ---------------------------
+
+
+@app.get("/app", response_class=HTMLResponse)
+async def app_page():
+    # Página única: UI moderna (dark), sem libs externas
+    return f"""<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Lotofácil • 12 mais / 3 menos</title>
+<style>
+:root {{
+  --bg:#0b1020; --card:#0f172a; --muted:#93a4bd; --fg:#e5eaf1; --soft:#101a33;
+  --green:#22c55e; --red:#ef4444; --acc:#38bdf8; --border:#1f2b46;
+}}
+*{{box-sizing:border-box}}
+body{{margin:0;background:linear-gradient(180deg,#0b1020,#0b1020);color:var(--fg);
+     font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Arial,sans-serif}}
+header{{padding:18px 16px;border-bottom:1px solid var(--border);
+       position:sticky;top:0;background:rgba(11,16,32,.9);backdrop-filter:blur(8px)}}
+h1{{margin:0;font-size:18px;letter-spacing:.2px}}
+main{{max-width:980px;margin:0 auto;padding:16px}}
+.card{{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:16px;margin:12px 0}}
+.row{{display:flex;gap:12px;flex-wrap:wrap}}
+.control label{{font-size:12px;color:var(--muted)}}
+input,select{{background:var(--soft);color:var(--fg);border:1px solid var(--border);
+             border-radius:10px;padding:10px 12px;outline:none}}
+button{{background:var(--acc);color:#001a24;border:0;border-radius:10px;
+      padding:10px 16px;font-weight:700;cursor:pointer}}
+button:disabled{{opacity:.7;cursor:wait}}
+small.muted{{color:var(--muted)}}
+.grid15{{display:grid;grid-template-columns:repeat(5,1fr);gap:14px;margin-top:10px}}
+.ball{{width:72px;height:72px;border-radius:50%;display:flex;align-items:center;
+      justify-content:center;font-weight:800;font-variant-numeric:tabular-nums;box-shadow:0 8px 24px #0004}}
+.ball.green{{background:radial-gradient(ellipse at 30% 30%,#40e07a,#1f9d4d)}}
+.ball.red{{background:radial-gradient(ellipse at 30% 30%,#ff7575,#c53434)}}
+.barwrap{{display:grid;grid-template-columns:repeat(25,1fr);gap:10px;align-items:end;margin-top:14px}}
+.bar{{background:linear-gradient(180deg,#89c4ff,#2a66ff);border-radius:9px 9px 4px 4px;position:relative}}
+.bar span{{position:absolute;bottom:calc(100% + 6px);left:50%;transform:translateX(-50%);
+          color:var(--muted);font-size:11px}}
+.bar label{{position:absolute;top:100%;left:50%;transform:translate(-50%,6px);color:var(--muted);font-size:12px}}
+.table{{width:100%;border-collapse:collapse}}
+.table th,.table td{{border-bottom:1px solid var(--border);padding:10px;text-align:left;vertical-align:top}}
+.badge{{display:inline-block;background:#0a1226;border:1px solid var(--border);padding:4px 8px;border-radius:999px;font-size:12px;margin-right:6px}}
+.footer{{text-align:center;color:var(--muted);padding:16px}}
+@media (max-width:720px){{.grid15 .ball{{width:60px;height:60px}} .barwrap{{gap:8px}}}}
+</style>
+</head>
+<body>
+<header>
+  <h1>Lotofácil – 12 mais / 3 menos</h1>
+</header>
+<main>
+  <div class="card">
+    <div class="row">
+      <div class="control"><label>Concursos (limit)</label><br>
+        <input id="limit" type="number" min="15" max="120" value="60">
+      </div>
+      <div class="control"><label>Mais (hi)</label><br>
+        <input id="hi" type="number" min="0" max="15" value="12">
+      </div>
+      <div class="control"><label>Menos (lo)</label><br>
+        <input id="lo" type="number" min="0" max="15" value="3">
+      </div>
+      <div class="control" style="display:flex;align-items:flex-end;gap:10px">
+        <label style="display:flex;align-items:center;gap:6px"><input id="force" type="checkbox"> Forçar atualização</label>
+        <button id="run">Atualizar</button>
+      </div>
+    </div>
+    <small class="muted" id="meta"></small>
+  </div>
+
+  <div class="card" id="comboCard">
+    <h3 style="margin:0 0 6px">Combinação sugerida <span class="badge">15 dezenas</span>
+      <span class="badge" id="parityBadge"></span></h3>
+    <small class="muted" id="subtitle"></small>
+    <div class="grid15" id="combo"></div>
+  </div>
+
+  <div class="card">
+    <h3 style="margin:0 0 6px">Frequência por dezena</h3>
+    <div class="barwrap" id="bars"></div>
+  </div>
+
+  <div class="card">
+    <h3 style="margin:0 0 6px">Últimos concursos</h3>
+    <table class="table" id="tbl">
+      <thead><tr><th>Concurso</th><th>Data</th><th>Dezenas</th><th>Padrão</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+
+  <div class="footer">Fonte: Sorte Online • API pessoal • v{APP_VERSION}</div>
+</main>
+
+<script>
+const fmt2 = n => String(n).padStart(2,'0');
+
+async function fetchJSON(u){ const r = await fetch(u); if(!r.ok) throw new Error('HTTP '+r.status); return r.json(); }
+
+function urlStats(){
+  const p = new URLSearchParams();
+  p.set('limit', document.getElementById('limit').value || '60');
+  p.set('hi', document.getElementById('hi').value || '12');
+  p.set('lo', document.getElementById('lo').value || '3');
+  if(document.getElementById('force').checked) p.set('force','true');
+  return '/stats?'+p.toString();
+}
+function urlLotofacil(){
+  const p = new URLSearchParams();
+  p.set('limit', document.getElementById('limit').value || '60');
+  return '/lotofacil?'+p.toString();
+}
+
+function renderCombo(s){
+  const el = document.getElementById('combo'); el.innerHTML='';
+  const hiSet = new Set(s.suggestion.hi); const loSet = new Set(s.suggestion.lo);
+  const sorted = s.suggestion.combo;
+  // Mostra somente as 15 dezenas sugeridas (verdes/12 e vermelhas/3)
+  sorted.forEach(n=>{
+    const d = document.createElement('div');
+    d.className = 'ball '+(hiSet.has(n)?'green':'red');
+    d.textContent = fmt2(n);
+    el.appendChild(d);
+  });
+  const meta = document.getElementById('subtitle');
+  meta.textContent = `últimos ${s.limit} concursos • jogos considerados: ${s.considered_games}`;
+  const badge = document.getElementById('parityBadge');
+  const pi = s.suggestion.parity;
+  badge.textContent = `${pi.pattern} (pares/ímpares)`;
+}
+
+function renderBars(s){
+  const el = document.getElementById('bars'); el.innerHTML='';
+  const freqs = s.frequencies.slice().sort((a,b)=>a.n-b.n);
+  const maxc = Math.max(...freqs.map(x=>x.count),1);
+  freqs.forEach(f=>{
+    const b = document.createElement('div');
+    b.className = 'bar';
+    b.style.height = (Math.round((f.count/maxc)*160)+20)+'px';
+    b.innerHTML = `<span>${f.count}</span><label>${fmt2(f.n)}</label>`;
+    el.appendChild(b);
+  });
+}
+
+function renderTable(list){
+  const tb = document.querySelector('#tbl tbody'); tb.innerHTML='';
+  (list.results||[]).forEach(r=>{
+    const tr = document.createElement('tr');
+    const nums = (r.numbers||[]).map(fmt2).join(' ');
+    tr.innerHTML = `
+      <td>${r.contest ?? '-'}</td>
+      <td>${r.date ?? '-'}</td>
+      <td style="font-family:ui-monospace,monospace">${nums}</td>
+      <td>${r.pattern} <span class="badge">${r.even_count}p/${r.odd_count}i</span></td>
+    `;
+    tb.appendChild(tr);
+  });
+}
+
+async function load(){
+  const btn = document.getElementById('run'); btn.disabled = true;
+  try{
+    const s = await fetchJSON(urlStats());
+    renderCombo(s); renderBars(s);
+    const l = await fetchJSON(urlLotofacil());
+    renderTable(l);
+    const meta = document.getElementById('meta');
+    meta.textContent = `Método: ${s.method} • Cache: ${s.cache_age_seconds ?? 0}s • Atualizado: ${s.updated_at}`;
+  }catch(e){
+    alert('Erro: '+(e.message||e));
+  }finally{ btn.disabled = false; }
+}
+
+document.getElementById('run').addEventListener('click', load);
+window.addEventListener('load', load);
+</script>
+</body></html>
+"""
