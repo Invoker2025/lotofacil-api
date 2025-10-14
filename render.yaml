@@ -5,17 +5,27 @@ services:
     plan: free
     region: oregon
     runtime: python
+
     buildCommand: |
       pip install -r requirements.txt
-      python -m playwright install chromium
-    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+
+    # Instalamos o Chromium no runtime (caso o cache não esteja presente)
+    # e só então iniciamos o servidor.
+    startCommand: >
+      bash -lc '
+      export XDG_CACHE_HOME=/opt/render/.cache &&
+      export PLAYWRIGHT_BROWSERS_PATH=/opt/render/.cache/ms-playwright &&
+      python -m playwright install chromium &&
+      uvicorn main:app --host 0.0.0.0 --port $PORT
+      '
+
     envVars:
       - key: PYTHON_VERSION
         value: 3.12.6
-      # Garante que o Playwright use o cache persistente do Render
       - key: XDG_CACHE_HOME
         value: /opt/render/.cache
       - key: PLAYWRIGHT_BROWSERS_PATH
         value: /opt/render/.cache/ms-playwright
+
     healthCheckPath: /health
     autoDeploy: true
