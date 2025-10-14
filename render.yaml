@@ -13,11 +13,7 @@ services:
       bash -lc '
       export XDG_CACHE_HOME=/opt/render/.cache &&
       export PLAYWRIGHT_BROWSERS_PATH=/opt/render/.cache/ms-playwright &&
-      if [ ! -f /opt/render/.cache/ms-playwright/chromium-1140/chrome-linux/chrome ]; then
-        echo "Chromium não encontrado, instalando..." &&
-        python -m playwright install chromium;
-      fi &&
-      python -m playwright install-deps &&
+      python -m playwright install chromium &&
       uvicorn main:app --host 0.0.0.0 --port $PORT
       '
 
