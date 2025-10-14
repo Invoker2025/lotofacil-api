@@ -2,10 +2,14 @@ services:
   - type: web
     name: lotofacil-api
     env: python
+    region: oregon
     plan: free
-    buildCommand: "pip install -r requirements.txt"
-    startCommand: "uvicorn main:app --host 0.0.0.0 --port $PORT"
-    autoDeploy: true
+    buildCommand: |
+      pip install -r requirements.txt
+      python -m playwright install --with-deps chromium
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
     envVars:
       - key: PYTHON_VERSION
         value: 3.12.5
+      - key: SCRAPERAPI_KEY
+        sync: false

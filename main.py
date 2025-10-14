@@ -1,6 +1,21 @@
+# main.py
+# Lotofácil API – SorteOnline + Playwright
+# ----------------------------------------
+# Observação importante:
+# 1) Este arquivo garante a instalação do Chromium no startup do Render.
+# 2) Endpoints: / (root), /health, /debug, /lotofacil?months=N
+# 3) Scraping no SorteOnline com Playwright (headless), respeitando robots/limites.
+
+from playwright.async_api import async_playwright
+import asyncio
 import os
 import re
+import sys
 import json
+import time
+import math
+import traceback
+import subprocess
 from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional
 
@@ -9,256 +24,360 @@ from fastapi.responses import JSONResponse
 from bs4 import BeautifulSoup
 from pydantic import BaseModel
 
-# Playwright (assíncrono)
-from playwright.async_api import async_playwright, Browser, Page
+# -------------------------------------------------------------
+# 1) Garante que o Chromium do Playwright seja instalado
+#    (essencial para o Render Free/Starter)
+# -------------------------------------------------------------
 
-APP_NAME = "Lotofácil API (Playwright)"
-BASE_URL = "https://www.sorteonline.com.br/lotofacil/resultados?pagina={page}"
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+
+def ensure_playwright_browsers() -> None:
+    """
+    Baixa o Chromium do Playwright caso ainda não esteja instalado.
+    Executa rápido se já existir em cache do Render.
+    """
+    try:
+        # Primeiro, tentamos instalar apenas o browser Chromium
+        subprocess.run(
+            [sys.executable, "-m", "playwright", "install", "chromium"],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+    except Exception as e:
+        # Em ambientes que precisam de libs do SO, podemos tentar install-deps (ignora erro)
+        try:
+            subprocess.run(
+                [sys.executable, "-m", "playwright", "install-deps", "chromium"],
+                check=False,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            subprocess.run(
+                [sys.executable, "-m", "playwright", "install", "chromium"],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+        except Exception as e2:
+            print(
+                f"[WARN] Falha ao instalar Chromium do Playwright: {e2}\n{traceback.format_exc()}")
+
+
+# chama a garantia de browsers ANTES de criar a app
+ensure_playwright_browsers()
+
+# -------------------------------------------------------------
+# 2) App & modelos
+# -------------------------------------------------------------
+APP_NAME = "Lotofácil API (SorteOnline)"
+VERSION = "2.2.0"
+
+app = FastAPI(title=APP_NAME, version=VERSION)
+
+# Estado compartilhado (browser/page)
+
+
+class AppState(BaseModel):
+    started_at: float = time.time()
+    chromium_ok: bool = False
+
+
+app.state.meta = AppState()
+app.state.browser = None
+app.state.context = None
+app.state.page = None
+
+# -------------------------------------------------------------
+# 3) Utilidades
+# -------------------------------------------------------------
+SORT_ONLINE_URL = "https://www.sorteonline.com.br/lotofacil/resultados?pagina={page}"
+
+UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
 )
 
-app = FastAPI(title=APP_NAME, version="2.1.0")
+HEADLESS = True  # Render não permite sandbox interativo
+LAUNCH_ARGS = [
+    "--no-sandbox",
+    "--disable-dev-shm-usage",
+    "--disable-gpu",
+    "--disable-dev-tools",
+    "--no-zygote",
+    "--single-process",
+]
 
-browser: Optional[Browser] = None  # será iniciado no startup
+# Regex útil para encontrar número do concurso / data
+RE_CONCURSO = re.compile(r"concurso\s*(\d+)", re.IGNORECASE)
+RE_DATA = re.compile(r"(\d{2}/\d{2}/\d{4})")
 
 
-class Concurso(BaseModel):
-    concurso: int
-    data: str      # ISO: YYYY-MM-DD
-    dezenas: List[int]
-
-
-def parse_date_pt(text: str) -> Optional[datetime]:
-    """
-    Aceita datas no formato 'dd/mm/aaaa' que aparecem no SorteOnline.
-    """
-    m = re.search(r"(\d{2})/(\d{2})/(\d{4})", text)
-    if not m:
-        return None
-    d, mth, y = map(int, m.groups())
+def parse_int(s: str) -> Optional[int]:
     try:
-        return datetime(y, mth, d)
-    except ValueError:
+        return int(re.sub(r"[^\d]", "", s))
+    except Exception:
         return None
 
 
-def extract_concursos_from_html(html: str) -> List[Concurso]:
-    """
-    Extrai múltiplos concursos de um HTML renderizado do SorteOnline.
-    Estratégia 'defensiva': usa BeautifulSoup + regex para tolerar mudanças de CSS.
-    """
-    soup = BeautifulSoup(html, "lxml")
+def parse_bolas(soup: BeautifulSoup) -> List[int]:
+    bolas = []
+    # Números geralmente aparecem como badges/bolinhas
+    for badge in soup.select("ul li, .badge, .dezena, .ball, .resultado-numero"):
+        txt = badge.get_text(strip=True)
+        if txt and txt.isdigit():
+            n = parse_int(txt)
+            if n is not None and 1 <= n <= 25:
+                bolas.append(n)
+    # evita ruído, Lotofácil sempre 15 dezenas
+    if len(bolas) >= 15:
+        return bolas[:15]
+    return bolas
 
-    # 1) Tenta achar "cards" por palavras típicas
-    cards: List[BeautifulSoup] = []
-    for tag in soup.find_all(True):
-        txt = tag.get_text(" ", strip=True)
-        if "Concurso" in txt and re.search(r"\b\d{2}/\d{2}/\d{4}\b", txt):
-            # Evita tags super pequenas
-            if len(txt) > 40:
-                cards.append(tag)
 
-    # Dedup "cards" por hash do texto
+def parse_premios(soup: BeautifulSoup) -> Dict[str, Any]:
+    # Tenta capturar algum resumo de prêmios quando disponível
+    data = {}
+    tab = soup.find("table")
+    if not tab:
+        return data
+    headers = [th.get_text(" ", strip=True) for th in tab.select("thead th")]
+    for tr in tab.select("tbody tr"):
+        cols = [td.get_text(" ", strip=True) for td in tr.find_all("td")]
+        if len(cols) == len(headers):
+            row = dict(zip(headers, cols))
+            # heurística:
+            if "Acertos" in row:
+                data[row["Acertos"]] = row
+    return data
+
+
+def parse_concursos_from_html(html: str) -> List[Dict[str, Any]]:
+    soup = BeautifulSoup(html, "html.parser")
+    concursos: List[Dict[str, Any]] = []
+
+    # Cada cartão de resultado costuma ficar em seções/divs específicas
+    # Variamos os seletores para tolerar mudanças leves de layout
+    cards = soup.select(
+        "section, article, div.card, div.resultado, div[class*='resultado']")
+    if not cards:
+        # fallback: tenta por listas grandes
+        cards = soup.select("div")
+
+    for block in cards:
+        txt = block.get_text(" ", strip=True)
+        if not txt:
+            continue
+
+        # detecta presença de "Concurso NNNN" no bloco
+        m = RE_CONCURSO.search(txt)
+        if not m:
+            continue
+        concurso = parse_int(m.group(1))
+        if not concurso:
+            continue
+
+        m2 = RE_DATA.search(txt)
+        data_str = m2.group(1) if m2 else None
+
+        bolas = parse_bolas(block)
+        if not bolas:
+            # pode estar em sub-árvore específica
+            inner = block.select_one(".dezenas, ul.dezenas, .numeros")
+            if inner:
+                bolas = parse_bolas(inner)
+
+        premios = parse_premios(block)
+
+        concursos.append({
+            "concurso": concurso,
+            "data": data_str,
+            "dezenas": bolas,
+            "premios": premios,
+        })
+
+    # remove duplicatas por concurso (mantém o primeiro)
     seen = set()
-    uniq_cards = []
-    for t in cards:
-        key = t.get_text(" ", strip=True)
-        if key not in seen:
-            seen.add(key)
-            uniq_cards.append(t)
-
-    resultados: List[Concurso] = []
-
-    for block in uniq_cards:
-        text = block.get_text(" ", strip=True)
-
-        # Concurso #
-        mc = re.search(r"Concurso\s*(\d+)", text, flags=re.I)
-        if not mc:
+    unique = []
+    for c in concursos:
+        k = c["concurso"]
+        if k in seen:
             continue
-        num = int(mc.group(1))
+        seen.add(k)
+        unique.append(c)
 
-        # Data
-        dt = parse_date_pt(text)
-        if not dt:
-            continue
-
-        # 15 dezenas (dois dígitos) em sequência no bloco
-        # Aceita separadores variados (espaços, vírgulas, quebras)
-        dezenas = re.findall(r"\b(\d{2})\b", text)
-        # Em alguns trechos o bloco é muito verboso; vamos tentar focar nas "bolinhas"
-        # procurando classes comuns de números (fallback abaixo)
-        if len(dezenas) < 15:
-            nums = []
-            for elm in block.find_all(True):
-                cls = " ".join(elm.get("class", []))
-                if re.search(r"(bola|dezena|number|num|lottery|resultado)", cls, re.I):
-                    t = elm.get_text(strip=True)
-                    if re.fullmatch(r"\d{2}", t):
-                        nums.append(t)
-            if len(nums) >= 15:
-                dezenas = nums
-
-        # filtra estritamente 15 dezenas, converte para int e ordena crescente
-        only_two_digits = [int(d)
-                           for d in dezenas if re.fullmatch(r"\d{2}", d)]
-        if len(only_two_digits) < 15:
-            # último recurso: pega as primeiras 15 válidas do bloco
-            only_two_digits = only_two_digits[:15]
-        if len(only_two_digits) != 15:
-            # não conseguimos 15 dezenas -> ignora o bloco
-            continue
-
-        only_two_digits.sort()
-        resultados.append(
-            Concurso(concurso=num, data=dt.date().isoformat(),
-                     dezenas=only_two_digits)
-        )
-
-    # Remove duplicados por número do concurso (mantém o mais novo)
-    by_concurso: Dict[int, Concurso] = {}
-    for c in sorted(resultados, key=lambda x: x.concurso, reverse=True):
-        by_concurso.setdefault(c.concurso, c)
-
-    return list(sorted(by_concurso.values(), key=lambda x: x.concurso, reverse=True))
+    return unique
 
 
-async def get_html(page: Page, url: str) -> str:
-    """
-    Carrega a URL com Playwright e devolve o HTML renderizado.
-    """
-    await page.route("**/*", lambda route: route.continue_())
-    await page.goto(url, wait_until="networkidle", timeout=45_000)
-    # Alguns sites só exibem números após um pequeno tempo
-    await page.wait_for_timeout(1200)
+async def goto_and_html(page, url: str, wait_selector: Optional[str] = None, timeout_ms: int = 25000) -> str:
+    await page.set_extra_http_headers({"Referer": "https://www.sorteonline.com.br/"})
+    await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+    # Tenta esperar por algo típico de resultados
+    if wait_selector:
+        try:
+            await page.wait_for_selector(wait_selector, timeout=timeout_ms)
+        except Exception:
+            pass
+    # Pequeno delay para JS terminar de compor a árvore
+    await asyncio.sleep(0.6)
     return await page.content()
+
+# -------------------------------------------------------------
+# 4) Lifecycle: abre e fecha o Playwright/Chromium
+# -------------------------------------------------------------
 
 
 @app.on_event("startup")
 async def startup() -> None:
     """
-    Sobe o Chromium headless no boot do serviço.
+    Sobe Chromium headless e mantém uma única page viva para as requisições.
     """
-    global browser
-    if browser:
-        return
-    pw = await async_playwright().start()
-    # Render Free costuma exigir --no-sandbox
-    browser = await pw.chromium.launch(
-        headless=True,
-        args=["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage"],
-    )
+    try:
+        pw = await async_playwright().start()
+        app.state._pw = pw
+        browser = await pw.chromium.launch(headless=HEADLESS, args=LAUNCH_ARGS)
+        ctx = await browser.new_context(user_agent=UA, locale="pt-BR", timezone_id="America/Sao_Paulo")
+        page = await ctx.new_page()
+        # (Opcional) set viewport fixo
+        await page.set_viewport_size({"width": 1280, "height": 800})
+
+        app.state.browser = browser
+        app.state.context = ctx
+        app.state.page = page
+        app.state.meta.chromium_ok = True
+        print("[startup] Chromium ok.")
+    except Exception as e:
+        app.state.meta.chromium_ok = False
+        print(
+            f"[startup] Falha ao iniciar Chromium: {e}\n{traceback.format_exc()}")
 
 
 @app.on_event("shutdown")
 async def shutdown() -> None:
-    global browser
     try:
-        if browser:
-            await browser.close()
-    except Exception:
-        pass
-    browser = None
+        if app.state.page:
+            await app.state.page.close()
+        if app.state.context:
+            await app.state.context.close()
+        if app.state.browser:
+            await app.state.browser.close()
+        if getattr(app.state, "_pw", None):
+            await app.state._pw.stop()
+        print("[shutdown] Playwright fechado.")
+    except Exception as e:
+        print(f"[shutdown] Erro: {e}")
+
+# -------------------------------------------------------------
+# 5) Endpoints
+# -------------------------------------------------------------
 
 
-@app.get("/", tags=["Root"])
-def root():
+@app.get("/")
+async def root():
     return {
         "ok": True,
         "message": "Lotofácil API online. Use /health, /debug?page=1 ou /lotofacil?months=3",
         "docs": "/docs",
+        "version": VERSION,
     }
 
 
-@app.get("/health", tags=["Health"])
-def health():
-    return {"status": "ok", "message": "Lotofácil API online!"}
+@app.get("/health")
+async def health():
+    return {"status": "ok", "message": "Lotofácil API online!", "chromium": app.state.meta.chromium_ok}
 
 
-@app.get("/debug", tags=["Debug"])
+@app.get("/debug")
 async def debug(page: int = Query(1, ge=1)):
     """
-    Retorna status e um snippet do HTML da página pedida (já renderizada).
+    Faz o fetch de uma página e devolve informações de diagnóstico:
+    - status 'ok' (se Chromium subiu)
+    - url alvo
+    - trecho do HTML
     """
-    if not browser:
-        raise HTTPException(503, "Browser não inicializado.")
-    context = await browser.new_context(user_agent=USER_AGENT, viewport={"width": 1280, "height": 2000})
-    page_obj = await context.new_page()
+    if not app.state.meta.chromium_ok or not app.state.page:
+        raise HTTPException(
+            status_code=500, detail="Chromium não está pronto (startup falhou).")
 
-    url = BASE_URL.format(page=page)
+    url = SORT_ONLINE_URL.format(page=page)
     try:
-        html = await get_html(page_obj, url)
-        soup = BeautifulSoup(html, "lxml")
-        snippet = soup.get_text(" ", strip=True)[:900]
-        return {"url": url, "status_code": 200, "qtd_text": len(snippet), "snippet": snippet}
-    finally:
-        await context.close()
+        html = await goto_and_html(app.state.page, url, wait_selector="main, body")
+        snippet = re.sub(r"\s+", " ", html[:1200])  # trechinho
+        return {
+            "page": page,
+            "url": url,
+            "len_html": len(html),
+            "snippet": snippet,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erro no debug: {e}")
 
 
-@app.get("/lotofacil", tags=["Lotofacil"])
+@app.get("/lotofacil")
 async def lotofacil(months: int = Query(3, ge=1, le=24)):
     """
-    Agrega concursos dos últimos 'months' meses a partir do SorteOnline,
-    paginando até atingir o limite temporal.
+    Coleta resultados da Lotofácil dos últimos N meses no SorteOnline.
+    Percorre páginas (1, 2, 3, ...) até cobrir o período.
     """
-    if not browser:
-        raise HTTPException(503, "Browser não inicializado.")
+    if not app.state.meta.chromium_ok or not app.state.page:
+        raise HTTPException(
+            status_code=500, detail="Chromium não está pronto (startup falhou).")
 
-    limite = datetime.now().date() - timedelta(days=30 * months)
-    coletados: List[Concurso] = []
-    page_num = 1
-    MAX_PAGES = 30  # segurança para não varrer infinito
+    # Período alvo:
+    hoje = datetime.now()
+    limite = hoje - timedelta(days=30 * months)
 
-    context = await browser.new_context(user_agent=USER_AGENT, viewport={"width": 1280, "height": 2400})
-    page_obj = await context.new_page()
-
+    concursos: List[Dict[str, Any]] = []
+    page_idx = 1
+    MAX_PAGES = 30  # limite de segurança
     try:
-        while page_num <= MAX_PAGES:
-            url = BASE_URL.format(page=page_num)
-            html = await get_html(page_obj, url)
-            concursos = extract_concursos_from_html(html)
+        while page_idx <= MAX_PAGES:
+            url = SORT_ONLINE_URL.format(page=page_idx)
+            html = await goto_and_html(app.state.page, url, wait_selector="main, body")
+            page_concursos = parse_concursos_from_html(html)
 
-            if not concursos:
-                # página sem resultados parseáveis -> para
+            if not page_concursos:
+                # nada encontrado -> para
                 break
 
-            # Filtra por data
-            antigos = 0
-            for c in concursos:
-                d = datetime.fromisoformat(c.data).date()
-                if d >= limite:
-                    coletados.append(c)
-                else:
-                    antigos += 1
+            # filtrar por data (se disponível), e ir acumulando
+            stop = False
+            for c in page_concursos:
+                d = None
+                if c.get("data"):
+                    try:
+                        d = datetime.strptime(c["data"], "%d/%m/%Y")
+                    except Exception:
+                        d = None
+                if d and d < limite:
+                    stop = True
+                    continue
+                concursos.append(c)
 
-            # Se a maioria já é antiga, paramos
-            if antigos >= len(concursos) // 2:
+            if stop:
                 break
 
-            page_num += 1
+            page_idx += 1
+            # pequeno respiro entre páginas
+            await asyncio.sleep(0.4)
 
-        # Dedup final por número
-        seen = set()
-        final: List[Dict[str, Any]] = []
-        for c in sorted(coletados, key=lambda x: x.concurso, reverse=True):
-            if c.concurso in seen:
-                continue
-            seen.add(c.concurso)
-            final.append(c.dict())
+        # ordena por concurso desc
+        concursos.sort(key=lambda x: x.get("concurso", 0), reverse=True)
 
-        return JSONResponse(
-            {
-                "meses": months,
-                "qtd": len(final),
-                # mantive a chave como concuros (sem acento) para estabilidade
-                "concuros": final,
-            }
-        )
+        return {"meses": months, "qtd": len(concursos), "concursos": concursos}
 
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(
-            500, f"Falha ao coletar SorteOnline via Playwright: {e}") from e
-    finally:
-        await context.close()
+            status_code=500, detail=f"Erro ao coletar Lotofácil: {e}")
+
+# -------------------------------------------------------------
+# 6) Execução local
+# -------------------------------------------------------------
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.getenv("PORT", "8000"))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
