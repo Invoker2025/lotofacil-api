@@ -1,9 +1,10 @@
 # main.py
-# Lotofácil API — FastAPI + Playwright + Parser de resultados
-# v3.0.0
+# Lotofácil API — FastAPI + Playwright + Parser + Paridade + Retry + Cache curto
+# v3.2.0
 
 import json
 import re
+import time
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from fastapi import FastAPI, Query, Response
@@ -16,9 +17,12 @@ except Exception:
     BeautifulSoup = None  # fallback se bs4 não estiver instalado
 
 APP_NAME = "Lotofacil API"
-APP_VERSION = "3.0.0"
-
+APP_VERSION = "3.2.0"
 DEFAULT_URL = "https://www.sorteonline.com.br/lotofacil/resultados"
+
+# Cache simples em memória para evitar bater no site a cada request
+CACHE_TTL_SECONDS = 120  # 2 min
+_cache: Dict[str, Any] = {"ts": 0.0, "html": None}
 
 app = FastAPI(
     title=APP_NAME,
@@ -28,13 +32,13 @@ app = FastAPI(
     redoc_url=None,
 )
 
-# --------------------- Playwright helper ---------------------
+# --------------------- Playwright helpers ---------------------
 
 
 async def render_page(url: str, timeout_ms: int = 45_000) -> str:
     """
     Abre Chromium headless, acessa a URL e retorna o HTML.
-    Usa wait_until="domcontentloaded" (mais rápido/estável no Render Free).
+    wait_until='domcontentloaded' é mais estável/rápido no Render Free.
     """
     launch_args = [
         "--no-sandbox",
@@ -53,6 +57,30 @@ async def render_page(url: str, timeout_ms: int = 45_000) -> str:
         finally:
             await browser.close()
 
+
+async def fetch_html(force: bool = False, retries: int = 2, timeout_ms: int = 45_000) -> str:
+    # cache curto
+    now = time.time()
+    if not force and _cache["html"] and (now - _cache["ts"] < CACHE_TTL_SECONDS):
+        return _cache["html"]
+
+    last_exc: Optional[Exception] = None
+    for attempt in range(1, max(1, retries) + 1):
+        try:
+            html = await render_page(DEFAULT_URL, timeout_ms=timeout_ms)
+            _cache["html"] = html
+            _cache["ts"] = time.time()
+            return html
+        except Exception as e:
+            last_exc = e
+            if attempt < retries:
+                # pequena espera entre tentativas (ajuda no cold start)
+                time.sleep(0.8)
+            else:
+                raise e
+    # só pra tipagem
+    raise last_exc or RuntimeError("Falha ao baixar HTML")
+
 # --------------------- Parser helpers -----------------------
 
 
@@ -64,29 +92,6 @@ def _to_int(x: Any) -> Optional[int]:
         return int(s)
     except Exception:
         return None
-
-
-def _looks_number_list(v: Any) -> bool:
-    """
-    Heurística: lista com >=15 valores (1..25) — típico de 15 dezenas da Lotofácil
-    """
-    if not isinstance(v, (list, tuple)):
-        return False
-    nums = []
-    for item in v:
-        n = _to_int(item)
-        if n is None:
-            return False
-        nums.append(n)
-    return len(nums) >= 15 and all(1 <= n <= 25 for n in nums)
-
-
-def _pick_first(d: Dict[str, Any], keys_like: Iterable[str]) -> Optional[Any]:
-    for k, v in d.items():
-        lk = k.lower()
-        if any(needle in lk for needle in keys_like):
-            return v
-    return None
 
 
 def _normalize_numbers(v: Any) -> Optional[List[int]]:
@@ -104,9 +109,6 @@ def _normalize_numbers(v: Any) -> Optional[List[int]]:
 
 
 def _walk(obj: Any) -> Iterable[Any]:
-    """
-    Iterador DFS sobre qualquer estrutura (dict/list/tuple/…)
-    """
     yield obj
     if isinstance(obj, dict):
         for v in obj.values():
@@ -116,19 +118,21 @@ def _walk(obj: Any) -> Iterable[Any]:
             yield from _walk(v)
 
 
+def _pick_first(d: Dict[str, Any], keys_like: Iterable[str]) -> Optional[Any]:
+    for k, v in d.items():
+        lk = k.lower()
+        if any(needle in lk for needle in keys_like):
+            return v
+    return None
+
+
 def parse_from_next_data(html: str, limit: int = 10) -> List[Dict[str, Any]]:
-    """
-    Tenta extrair os concursos do JSON Next.js (__NEXT_DATA__).
-    Retorna lista de dicts com: contest, date, numbers (15), [city/state] quando disponível.
-    """
     if BeautifulSoup is None:
         return []
-
     soup = BeautifulSoup(html, "html.parser")
     script = soup.find("script", id="__NEXT_DATA__")
     if not script or not script.string:
         return []
-
     try:
         data = json.loads(script.string)
     except Exception:
@@ -141,46 +145,33 @@ def parse_from_next_data(html: str, limit: int = 10) -> List[Dict[str, Any]]:
         if not isinstance(node, dict):
             continue
 
-        # Pistas de que o node é da Lotofácil
-        texto = json.dumps(node, ensure_ascii=False).lower()
-        if "loto" not in texto and "facil" not in texto and "lotofácil" not in texto:
-            # ainda assim pode conter o bloco correto; não filtramos agressivo
-            pass
-
-        # Procura uma lista de 15 números
+        # acha lista de 15 dezenas
         numbers = None
-        for k, v in node.items():
+        for _, v in node.items():
             cand = _normalize_numbers(v)
             if cand:
                 numbers = cand
                 break
-
         if not numbers:
             continue
 
-        # Concurso
+        # concurso
         contest = None
         for k, v in node.items():
-            lk = k.lower()
-            if "concurso" in lk or "contest" in lk or "sorteio" in lk or "draw" in lk:
-                if isinstance(v, (str, int)):
-                    ci = _to_int(v)
-                    if ci:
-                        contest = ci
-                        break
+            if any(x in k.lower() for x in ("concurso", "contest", "sorteio", "draw")):
+                ci = _to_int(v) if isinstance(v, (str, int)) else None
+                if ci:
+                    contest = ci
+                    break
 
-        # Data (string)
+        # data
         date = None
         for k, v in node.items():
-            lk = k.lower()
-            if "data" in lk or "date" in lk:
-                if isinstance(v, str) and len(v) >= 8:
+            if any(x in k.lower() for x in ("data", "date")):
+                if isinstance(v, str) and len(v) >= 6:
                     date = v
                     break
 
-        # Cidade/UF (se existir)
-        city = None
-        uf = None
         city = _pick_first(node, ["cidade", "city", "local"])
         uf = _pick_first(node, ["uf", "estado", "state"])
 
@@ -200,34 +191,24 @@ def parse_from_next_data(html: str, limit: int = 10) -> List[Dict[str, Any]]:
             }
         )
 
-        if len(results) >= max(1, limit):
+        if len(results) >= limit:
             break
 
-    # Ordena por número do concurso (desc) quando possível
     results.sort(key=lambda x: (
         x["contest"] is not None, x["contest"]), reverse=True)
     return results[:limit]
 
 
 def parse_from_html_regex(html: str, limit: int = 10) -> List[Dict[str, Any]]:
-    """
-    Fallback: usa regex para localizar blocos de 15 dezenas e (se possível) o número/data do concurso.
-    Menos confiável, mas suficiente quando o JSON não está disponível.
-    """
     results: List[Dict[str, Any]] = []
-
-    # Encontra todas as sequências com 15 dezenas (1..25), em ordem.
-    # Aceita "01" ou "1", separados por espaço, vírgula ou <li>/<span> etc.
+    # bloco de 15 dezenas
     dezena = r"(?:0?[1-9]|1\d|2[0-5])"
-    sep = r"(?:\s*[,|/•\-]?\s*|</[^>]+>\s*<[^>]+>)"  # separadores flexíveis
+    sep = r"(?:\s*[,|/•\-]?\s*|</[^>]+>\s*<[^>]+>)"
     bloco = rf"({dezena}(?:{sep}{dezena}){{14}})"
     blocks = re.findall(bloco, html)
 
-    # Concurso (pegamos o mais próximo, depois ajustamos)
-    # Exemplos no HTML: "Concurso 3511", "concurso n° 3511", "Result. da Lotofácil 3511"
     re_concurso = re.compile(
         r"concurs(?:o|o nº|o n[oº])\s*[:#]?\s*(\d{3,5})", re.I)
-    # Data (bem flex): 12/10/2025, 2025-10-12, 12 de out, etc.
     re_data = re.compile(
         r"(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}|\d{4}[\/\-]\d{1,2}[\/\-]\d{1,2}|"
         r"\d{1,2}\s+de\s+[A-Za-zçãéíóú]+\s+\d{2,4})",
@@ -235,34 +216,29 @@ def parse_from_html_regex(html: str, limit: int = 10) -> List[Dict[str, Any]]:
     )
 
     for b in blocks:
-        # Normaliza e transforma em lista de ints
         nums = re.findall(r"\d{1,2}", b)
         cand = [_to_int(n) for n in nums]
         cand = [n for n in cand if n is not None]
-        if len(cand) >= 15:
+        if len(cand) >= 15 and all(1 <= n <= 25 for n in cand[:15]):
             cand = cand[:15]
-            if all(1 <= n <= 25 for n in cand):
-                # tenta achar concurso e data próximos do bloco
-                # (janela de 1200 chars ao redor)
-                idx = html.find(b)
-                snippet_around = html[max(0, idx - 1200): idx + len(b) + 1200]
-                m_conc = re_concurso.search(snippet_around)
-                m_data = re_data.search(snippet_around)
+            idx = html.find(b)
+            snippet_around = html[max(0, idx - 1200): idx + len(b) + 1200]
+            m_conc = re_concurso.search(snippet_around)
+            m_data = re_data.search(snippet_around)
+            results.append(
+                {
+                    "contest": _to_int(m_conc.group(1)) if m_conc else None,
+                    "date": m_data.group(1) if m_data else None,
+                    "numbers": cand,
+                    "city": None,
+                    "state": None,
+                    "source": "regex_html",
+                }
+            )
+            if len(results) >= limit:
+                break
 
-                results.append(
-                    {
-                        "contest": _to_int(m_conc.group(1)) if m_conc else None,
-                        "date": m_data.group(1) if m_data else None,
-                        "numbers": cand,
-                        "city": None,
-                        "state": None,
-                        "source": "regex_html",
-                    }
-                )
-                if len(results) >= limit:
-                    break
-
-    # Dedup por (contest, tuple(numbers))
+    # dedup
     seen = set()
     uniq: List[Dict[str, Any]] = []
     for r in results:
@@ -278,19 +254,25 @@ def parse_from_html_regex(html: str, limit: int = 10) -> List[Dict[str, Any]]:
 
 
 def parse_lotofacil(html: str, limit: int = 10) -> Dict[str, Any]:
-    """
-    Pipeline de parsing: tenta Next.js JSON; se falhar, usa regex.
-    """
     data = parse_from_next_data(html, limit=limit)
     method = "next_data"
     if not data:
         data = parse_from_html_regex(html, limit=limit)
         method = "regex_html"
+    return {"count": len(data), "method": method, "results": data}
 
+# ---------------------- Paridade ----------------------
+
+
+def parity_info(nums: List[int]) -> Dict[str, Any]:
+    even = [n for n in nums if n % 2 == 0]
+    odd = [n for n in nums if n % 2 != 0]
     return {
-        "count": len(data),
-        "method": method,
-        "results": data,
+        "even_count": len(even),
+        "odd_count": len(odd),
+        "even": even,
+        "odd": odd,
+        "pattern": f"{len(even)}-{len(odd)}",
     }
 
 # ------------------------- Rotas --------------------------
@@ -304,7 +286,7 @@ async def root():
         "docs": "/docs",
         "health": "/health",
         "ready": "/ready",
-        "examples": {"debug": "/debug?page=1", "lotofacil": "/lotofacil?months=3"},
+        "examples": {"debug": "/debug?page=1", "lotofacil": "/lotofacil?limit=10"},
     }
 
 
@@ -336,7 +318,7 @@ async def ready_check():
 @app.get("/debug", response_class=JSONResponse)
 async def debug(page: Optional[int] = Query(default=1, ge=1, le=10)):
     try:
-        html = await render_page(DEFAULT_URL, timeout_ms=45_000)
+        html = await fetch_html(force=True, retries=2, timeout_ms=45_000)
         snippet = html[:600].replace("\n", " ")
         return {"page": page, "len": len(html), "snippet": snippet}
     except PWTimeoutError as e:
@@ -347,26 +329,72 @@ async def debug(page: Optional[int] = Query(default=1, ge=1, le=10)):
 
 @app.get("/lotofacil", response_class=JSONResponse)
 async def lotofacil(
-    months: int = Query(default=3, ge=1, le=24,
-                        description="Compatibilidade — não usado como filtro real"),
     limit: int = Query(default=10, ge=1, le=50,
                        description="Qtde de concursos para retornar (mais recentes)"),
+    # filtros de paridade
+    pattern: Optional[str] = Query(
+        default=None, pattern=r"^\d{1,2}-\d{1,2}$", description="Ex.: 8-7 (pares-ímpares)"),
+    min_even: Optional[int] = Query(default=None, ge=0, le=15),
+    max_even: Optional[int] = Query(default=None, ge=0, le=15),
+    # cache
+    force: bool = Query(
+        default=False, description="Se true, ignora cache curto e força novo scrape"),
 ):
     """
-    Renderiza a página de resultados e extrai os concursos.
-    - `limit` controla quantos concursos retornam (default 10).
-    - `months` mantido apenas por compatibilidade.
+    Renderiza a página, extrai concursos e calcula pares/ímpares.
+    Filtros opcionais: pattern=8-7, min_even/max_even. Cache curto (~2min).
     """
     try:
-        html = await render_page(DEFAULT_URL, timeout_ms=60_000)
+        html = await fetch_html(force=force, retries=2, timeout_ms=60_000)
         parsed = parse_lotofacil(html, limit=limit)
+
+        # pós-processa paridade
+        items = []
+        for r in parsed["results"]:
+            p = parity_info(r["numbers"])
+            items.append({**r, **p})
+
+        # filtros de paridade
+        if pattern:
+            try:
+                want_even, want_odd = (int(x) for x in pattern.split("-"))
+                items = [x for x in items if x["even_count"] ==
+                         want_even and x["odd_count"] == want_odd]
+            except Exception:
+                pass
+
+        if min_even is not None:
+            items = [x for x in items if x["even_count"] >= min_even]
+        if max_even is not None:
+            items = [x for x in items if x["even_count"] <= max_even]
+
+        # resumo
+        hist: Dict[str, int] = {}
+        total_even = total_odd = 0
+        for x in items:
+            hist[x["pattern"]] = hist.get(x["pattern"], 0) + 1
+            total_even += x["even_count"]
+            total_odd += x["odd_count"]
+
+        n = max(1, len(items))
+        summary = {
+            "histogram": dict(sorted(hist.items(), key=lambda kv: (-kv[1], kv[0]))),
+            "avg_even": round(total_even / n, 2),
+            "avg_odd": round(total_odd / n, 2),
+        }
+
         return {
             "ok": True,
             "limit": limit,
-            "months": months,
-            **parsed,
+            "filters": {"pattern": pattern, "min_even": min_even, "max_even": max_even, "force": force},
+            "summary": summary,
+            "count": len(items),
+            "results": items,
             "source_url": DEFAULT_URL,
+            "method": parsed["method"],
+            "cache_age_seconds": round(time.time() - _cache["ts"], 2) if _cache["html"] else None,
         }
+
     except PWTimeoutError as e:
         return JSONResponse(status_code=504, content={"detail": f"Timeout na lotofacil: {str(e)}"})
     except Exception as e:
