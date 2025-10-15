@@ -1,29 +1,21 @@
 services:
   - type: web
-    name: lotofacil-api
-    env: python
-    plan: free
-    region: oregon
+    name: lotofacil-api           # mantenha o mesmo nome do serviço atual
     runtime: python
-
-    buildCommand: |
-      pip install -r requirements.txt
-
-    startCommand: >
-      bash -lc '
-      export XDG_CACHE_HOME=/opt/render/.cache &&
-      export PLAYWRIGHT_BROWSERS_PATH=/opt/render/.cache/ms-playwright &&
-      python -m playwright install chromium &&
-      uvicorn main:app --host 0.0.0.0 --port $PORT
-      '
-
+    plan: free                    # troque se desejar
     envVars:
       - key: PYTHON_VERSION
-        value: 3.12.6
-      - key: XDG_CACHE_HOME
-        value: /opt/render/.cache
-      - key: PLAYWRIGHT_BROWSERS_PATH
-        value: /opt/render/.cache/ms-playwright
-
+        value: 3.12.3
+      - key: PW_TIMEOUT_MS        # tempo padrão do Playwright por página (ms)
+        value: "12000"
+      - key: MAX_PAGES_DEFAULT    # páginas para scraping normal
+        value: "6"
+      - key: MAX_PAGES_FORCE      # páginas quando ?force=true
+        value: "12"
+    buildCommand: |
+      pip install --upgrade pip
+      pip install -r requirements.txt
+      python -m playwright install chromium   # sem --with-deps no Render
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /health
     autoDeploy: true
