@@ -2,15 +2,12 @@ services:
   - type: web
     name: lotofacil-api
     env: python
-    plan: free
-    region: oregon           # deixe igual ao seu se for diferente
     buildCommand: |
-      pip install -U pip
       pip install -r requirements.txt
       python -m playwright install chromium
     startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
     envVars:
-      - key: PYTHON_VERSION
-        value: 3.12.6
       - key: PLAYWRIGHT_BROWSERS_PATH
         value: /opt/render/.cache/ms-playwright
+      - key: PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS
+        value: "1"
