@@ -1,9 +1,8 @@
 {
     "name": "Lotofácil",
     "short_name": "Lotofácil",
-    "start_url": "/app",
-    "scope": "/",
     "display": "standalone",
+    "start_url": "/app",
     "background_color": "#0f172a",
     "theme_color": "#0f172a",
     "icons": [
@@ -16,12 +15,6 @@
             "src": "/static/icon-512.png",
             "sizes": "512x512",
             "type": "image/png"
-        },
-        {
-            "src": "/static/apple-touch-icon.png",
-            "sizes": "180x180",
-            "type": "image/png",
-            "purpose": "any"
         }
     ]
 }
