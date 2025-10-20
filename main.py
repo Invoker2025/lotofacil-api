@@ -1,16 +1,9 @@
-# v6.2.0 - Lotofacil API 🎯 (fonte: CAIXA)
-# - Fonte oficial CAIXA (JSON)
-# - Coleta robusta com:
-#     * headers iguais ao site (X-Requested-With, Accept-Language, etc.)
-#     * anti-cache por query (_=timestamp)
-#     * fallback de hosts (servicebus2 + loterias)
-#     * fallback de rota (?concurso=N) e também /N
-#     * serialização das requisições específicas + backoff curto
-#     * validação forte: somente 15 dezenas únicas (1..25) por concurso
-# - Endpoints:
-#     /ready  /lotofacil  /stats  /parity  /app
-# - /parity: janela 1m, 3m, 1y ou custom (start/end ISO YYYY-MM-DD)
-# - UI simples (Chart.js) em /app
+# Lotofacil API – v6.3.0
+# - Fonte primária: CAIXA (HTTP JSON)
+# - Fallback: mirror público (somente leitura) quando a CAIXA bloquear do datacenter
+# - Janela 1..12m, ou "all", ou datas customizadas (start/end)
+# - /app com meta incluindo "concurso mais atual"
+# - Sem Playwright/Chromium (leve e compatível com Render Free)
 
 from __future__ import annotations
 
@@ -29,26 +22,30 @@ from fastapi.middleware.cors import CORSMiddleware
 # ------------------------------------------------------------------------------
 # Config
 # ------------------------------------------------------------------------------
-APP_VERSION = "6.2.0"
+APP_VERSION = "6.3.0"
 
 CAIXA_HOSTS = [
     "https://servicebus2.caixa.gov.br/portaldeloterias/api/lotofacil",
     "https://loterias.caixa.gov.br/portaldeloterias/api/lotofacil",
 ]
 
+# Fallback (mirror público somente leitura)
+MIRROR_LATEST = "https://loteriascaixa-api.herokuapp.com/api/lotofacil/latest"
+MIRROR_BY_ID = "https://loteriascaixa-api.herokuapp.com/api/lotofacil/{n}"
+
 HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "12"))     # segs
-# reqs por leva (apenas para "últimos N")
+# não usado no serial, mantido p/ compat
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "20"))
-AGG_TTL_SEC = int(os.getenv("AGG_TTL_SEC", "120"))     # cache dos agregados
-CAIXA_TTL_SEC = int(os.getenv("CAIXA_TTL_SEC", "120")
-                    )   # cache das respostas da CAIXA
+AGG_TTL_SEC = int(os.getenv("AGG_TTL_SEC", "120"))      # cache dos agregados
+# cache de chamadas à CAIXA/mirror
+CAIXA_TTL_SEC = int(os.getenv("CAIXA_TTL_SEC", "120"))
 
 # ------------------------------------------------------------------------------
 # Estado global
 # ------------------------------------------------------------------------------
 _http: httpx.AsyncClient | None = None
 _caixa_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}  # key->(ts,json)
-_agg_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}  # key->(ts,payload)
+_agg_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}    # key->(ts,payload)
 
 # ------------------------------------------------------------------------------
 # App
@@ -66,7 +63,7 @@ app.add_middleware(
 
 
 async def ensure_http() -> httpx.AsyncClient:
-    """Cria um client httpx com headers muito próximos do site oficial."""
+    """Client httpx com headers bem próximos do site oficial."""
     global _http
     if _http is None:
         _http = httpx.AsyncClient(
@@ -167,34 +164,24 @@ def parse_draw_date(s: str) -> Optional[dt.date]:
 
 def window_to_range(window: str) -> Tuple[Optional[dt.date], Optional[dt.date]]:
     """
-    Aceita: 'Xm' (1–12) ou 'all'. (Opcional: '1y' tratado como 12m.)
+    Aceita: 'Xm' (1–12) ou 'all'. (Alias opcional '1y' -> '12m'.)
     """
     today = dt.date.today()
-
-    # alias opcional: '1y' -> '12m'
     if window == "1y":
         window = "12m"
 
-    # 'Xm' (meses)
     m = re.fullmatch(r"(\d{1,2})m", window)
     if m:
         months = int(m.group(1))
-        if months < 1:
-            months = 1
-        if months > 12:
-            months = 12
-
-        # andar 'months' meses para trás com segurança (sem estourar dia)
+        months = min(12, max(1, months))
         year = today.year
         month = today.month - months
         while month <= 0:
             month += 12
             year -= 1
-        # usa min(day, 28) para evitar datas inválidas (fev, etc.)
         start = dt.date(year, month, min(today.day, 28))
         return start, today
 
-    # tudo
     if window == "all":
         return None, today
 
@@ -233,7 +220,11 @@ def summarize_draws(draws: List[dict]) -> Dict[str, Any]:
             hist["outros"] += 1
         evens.append(e)
         odds.append(o)
-    return {"histogram": hist, "avg_even": round(sum(evens)/total, 1), "avg_odd": round(sum(odds)/total, 1)}
+    return {
+        "histogram": hist,
+        "avg_even": round(sum(evens)/total, 1),
+        "avg_odd": round(sum(odds)/total, 1),
+    }
 
 
 def frequencies(draws: List[dict]) -> List[Dict[str, Any]]:
@@ -268,14 +259,13 @@ def build_parity_suggestion(draws: List[dict], even_needed: int = 8, odd_needed:
     }
 
 # ------------------------------------------------------------------------------
-# CAIXA API – normalização + chamadas robustas
+# CAIXA API + Fallback Mirror
 # ------------------------------------------------------------------------------
 
 
 def _normalize_json(j: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """
-    Normaliza UM concurso e valida:
-      - 15 dezenas únicas ∈ [1..25]
+    Normaliza UM concurso e valida: 15 dezenas únicas ∈ [1..25]
     """
     try:
         numero = int(j.get("numero"))
@@ -291,38 +281,74 @@ def _normalize_json(j: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         return None
 
 
+async def _mirror_get_latest() -> dict | None:
+    try:
+        client = await ensure_http()
+        r = await client.get(MIRROR_LATEST, timeout=HTTP_TIMEOUT)
+        r.raise_for_status()
+        j = r.json()
+        data = _normalize_json(j)
+        if data:
+            data["source"] = "mirror"
+            return data
+    except Exception:
+        pass
+    return None
+
+
+async def _mirror_get_concurso(n: int) -> dict | None:
+    try:
+        client = await ensure_http()
+        r = await client.get(MIRROR_BY_ID.format(n=n), timeout=HTTP_TIMEOUT)
+        if r.status_code == 404:
+            return None
+        r.raise_for_status()
+        j = r.json()
+        if int(j.get("numero", 0)) != int(n):
+            return None
+        data = _normalize_json(j)
+        if data:
+            data["source"] = "mirror"
+            return data
+    except Exception:
+        pass
+    return None
+
+
 async def _caixa_get_latest() -> Dict[str, Any]:
     cache_key = "latest"
     cached = _cache_get(_caixa_cache, cache_key, CAIXA_TTL_SEC)
     if cached:
         return cached
     client = await ensure_http()
-    # pegamos do primeiro host; se falhar, tentamos o segundo
+    # tenta CAIXA (dois hosts)
     for base in CAIXA_HOSTS:
         try:
             r = await client.get(base, params={"_": int(time.time()*1000)}, follow_redirects=True)
             r.raise_for_status()
             j = r.json()
             data = _normalize_json(j)
-            if not data:  # ainda que falhe a normalização, devolvemos ao menos o número
+            if not data:
+                # resposta inválida → tenta mirror
+                m = await _mirror_get_latest()
+                if m:
+                    _cache_put(_caixa_cache, cache_key, m)
+                    return m
                 data = {"contest": int(j.get("numero", 0)), "date": j.get(
                     "dataApuracao") or "", "numbers": [], "source": "caixa"}
             _cache_put(_caixa_cache, cache_key, data)
             return data
         except httpx.HTTPError:
             continue
-    # se tudo falhar, devolvemos um placeholder
+    # CAIXA falhou → mirror
+    m = await _mirror_get_latest()
+    if m:
+        _cache_put(_caixa_cache, cache_key, m)
+        return m
     return {"contest": 0, "date": "", "numbers": [], "source": "caixa"}
 
 
 async def _caixa_get_concurso(n: int) -> Optional[Dict[str, Any]]:
-    """
-    Busca 1 concurso específico, tentando:
-      - ?concurso=N com anti-cache
-      - /N com anti-cache
-    Valida que j['numero'] == N (senão a API devolveu o último; descartamos).
-    Serializado + backoff curto para driblar caches intermediários.
-    """
     cache_key = f"c:{n}"
     cached = _cache_get(_caixa_cache, cache_key, CAIXA_TTL_SEC)
     if cached:
@@ -332,7 +358,8 @@ async def _caixa_get_concurso(n: int) -> Optional[Dict[str, Any]]:
     ts = int(time.time() * 1000)
     variants = []
     for base in CAIXA_HOSTS:
-        variants.append({"url": base,      "params": {"concurso": n, "_": ts}})
+        variants.append(
+            {"url": base,         "params": {"concurso": n, "_": ts}})
         variants.append({"url": f"{base}/{n}", "params": {"_": ts}})
 
     for item in variants:
@@ -344,7 +371,6 @@ async def _caixa_get_concurso(n: int) -> Optional[Dict[str, Any]]:
             r.raise_for_status()
             j = r.json()
             if int(j.get("numero", 0)) != int(n):
-                # API ignorou o parâmetro -> tenta próxima variante
                 await _sleep_ms(60)
                 continue
             data = _normalize_json(j)
@@ -356,6 +382,12 @@ async def _caixa_get_concurso(n: int) -> Optional[Dict[str, Any]]:
         except httpx.HTTPError:
             await _sleep_ms(80)
             continue
+
+    # CAIXA falhou → tenta mirror
+    m = await _mirror_get_concurso(n)
+    if m:
+        _cache_put(_caixa_cache, cache_key, m)
+        return m
     return None
 
 # ------------------------------------------------------------------------------
@@ -364,7 +396,6 @@ async def _caixa_get_concurso(n: int) -> Optional[Dict[str, Any]]:
 
 
 async def collect_last_n(limit: int) -> list[dict]:
-    """Coleta os últimos `limit` concursos válidos (15 dezenas)."""
     latest = await _caixa_get_latest()
     last_n = int(latest.get("contest") or 0)
     if last_n <= 0:
@@ -372,7 +403,6 @@ async def collect_last_n(limit: int) -> list[dict]:
     results: List[dict] = []
     n = last_n
     while n >= 1 and len(results) < limit:
-        # serialização de N em N (evita a API confundir resposta)
         got = await _caixa_get_concurso(n)
         if got:
             results.append(got)
@@ -381,19 +411,13 @@ async def collect_last_n(limit: int) -> list[dict]:
 
 
 async def collect_by_date(start: Optional[dt.date], end: Optional[dt.date], max_fetch: int = 400) -> list[dict]:
-    """
-    Busca concursos decrescendo até cobrir a janela [start, end].
-    Como o endpoint específico sofre com cache, mantemos serializado.
-    """
     latest = await _caixa_get_latest()
     last_n = int(latest.get("contest") or 0)
     if last_n <= 0:
         return []
-
     results: List[dict] = []
     fetched = 0
     n = last_n
-
     while n >= 1 and fetched < max_fetch:
         d = await _caixa_get_concurso(n)
         fetched += 1
@@ -404,7 +428,6 @@ async def collect_by_date(start: Optional[dt.date], end: Optional[dt.date], max_
         if dd is None:
             continue
         if start and dd < start:
-            # já cruzamos o início da janela; se já temos algo, podemos encerrar
             if results:
                 break
             else:
@@ -412,8 +435,6 @@ async def collect_by_date(start: Optional[dt.date], end: Optional[dt.date], max_
         if end and dd > end:
             continue
         results.append(d)
-
-    # ordenar desc por concurso
     results.sort(key=lambda x: int(x["contest"]), reverse=True)
     return results
 
@@ -538,7 +559,6 @@ async def parity(
     odd: int = Query(7, ge=0, le=15),
     force: bool = False,
 ):
-
     cache = None if force else _agg_get(
         "parity", window=window, start=start, end=end, even=even, odd=odd)
     if cache:
@@ -555,7 +575,6 @@ async def parity(
         sd, ed = window_to_range(window)
 
     draws = await collect_by_date(sd, ed, max_fetch=400)
-
     sugg = build_parity_suggestion(draws, even_needed=even, odd_needed=odd)
     freqs = frequencies(draws)
 
@@ -580,7 +599,7 @@ async def parity(
     return payload
 
 # ------------------------------------------------------------------------------
-# UI simples
+# UI simples (/app)
 # ------------------------------------------------------------------------------
 
 
@@ -622,24 +641,22 @@ async def ui():
     <div class="row">
       <div>Janela</div>
       <select id="selWindow"></select>
-        <script>
-        // preencher select com 1..12 meses + "Tudo"
+      <script>
         (function fillWindowOptions(){
-            const sel = document.getElementById('selWindow');
-            for (let m = 1; m <= 12; m++) {
+          const sel = document.getElementById('selWindow');
+          for (let m = 1; m <= 12; m++) {
             const opt = document.createElement('option');
             opt.value = `${m}m`;
             opt.textContent = m === 1 ? '1 mês' : `${m} meses`;
-            if (m === 3) opt.selected = true; // padrão 3m
+            if (m === 3) opt.selected = true;
             sel.appendChild(opt);
-            }
-            const all = document.createElement('option');
-            all.value = 'all';
-            all.textContent = 'Tudo';
-            sel.appendChild(all);
+          }
+          const all = document.createElement('option');
+          all.value = 'all';
+          all.textContent = 'Tudo';
+          sel.appendChild(all);
         })();
-        </script>
-
+      </script>
 
       <div>Custom:</div>
       <input id="inpStart" type="date" />
@@ -684,12 +701,10 @@ async function fetchJSON(url) {
   if (!res.ok) throw new Error("HTTP " + res.status);
   return await res.json();
 }
-
 function ball(n) {
   const cls = (n % 2 === 0) ? 'g' : 'r';
   return `<div class="ball ${cls}">${String(n).padStart(2,'0')}</div>`;
 }
-
 let freqChart = null;
 
 async function loadAll() {
@@ -707,28 +722,22 @@ async function loadAll() {
     url = `/parity?even=${E}&odd=${O}${s}${e}${force}`;
   }
 
-  // 👉 pega os dados da paridade e, em paralelo, o último concurso em /ready
-  const [p, rdy] = await Promise.all([
-    fetchJSON(url),
-    fetchJSON('/ready')
-  ]);
-
-  // compatível com a resposta do /ready deste backend (latest_contest)
+  // pega paridade e /ready em paralelo
+  const [p, rdy] = await Promise.all([ fetchJSON(url), fetchJSON('/ready') ]);
   const latestContest = rdy?.latest_contest ?? '—';
 
-  // 👉 aqui adicionamos "concurso mais atual: XX" na mesma linha
   document.getElementById('meta').innerText =
     `método: ${p.method} · Atualizado: ${p.updated_at} · jogos considerados: ${p.considered_games} · ` +
     `janela: ${p.start || '—'} → ${p.end || '—'} · concurso mais atual: ${latestContest}`;
 
-  // Sugerida
+  // sugerida
   const s = p.suggestion;
   document.getElementById('pillParidade').innerText = s.pattern + ' (pares/ímpares)';
   let html = '';
   for (const n of s.combo) html += ball(n);
   document.getElementById('suggBalls').innerHTML = html;
 
-  // Frequências
+  // gráfico
   const labels = p.frequencies.map(x => String(x.n).padStart(2,'0'));
   const data = p.frequencies.map(x => x.count);
   if (freqChart) freqChart.destroy();
@@ -739,7 +748,7 @@ async function loadAll() {
     options: { responsive:true, plugins:{legend:{display:false}} }
   });
 
-  // Tabela de amostra (10 últimos)
+  // amostra 10 últimos
   const lotos = await fetchJSON('/lotofacil?limit=10');
   const tb = document.querySelector('#tbl tbody');
   tb.innerHTML = '';
