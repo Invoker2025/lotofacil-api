@@ -675,48 +675,33 @@ async def parity(
 # ------------------------------------------------------------------------------
 
 
+
 @app.get("/app", response_class=HTMLResponse)
 async def ui():
-    return HTMLResponse(f"""
-<!doctype html>
+    html = """<!doctype html>
 <html lang="pt-br">
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Lotofácil</title>
 <style>
-:root {{ color-scheme: dark; }}
-body {{ background:#0f172a; color:#e2e8f0; font-family: ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto; }}
-.wrap {{ max-width:1024px; margin:24px auto; padding:0 16px; }}
-.card {{ background:#0b1220; border:1px solid #1e293b; border-radius:12px; padding:16px; margin:16px 0; }}
-.title {{ font-weight:700; font-size:18px; margin-bottom:8px; }}
-.row {{ display:flex; gap:12px; align-items:center; flex-wrap:wrap; }}
-input,select,button {{ background:#0b1220; color:#e2e8f0; border:1px solid #1e293b; border-radius:10px; padding:10px 12px; }}
-button {{ cursor:pointer; }}
-.pill {{ border-radius:999px; padding:10px 14px; border:1px solid #1e293b; }}
-.badges {{ display:flex; gap:12px; flex-wrap:wrap; }}
-.badge {{ background:#0b1220; border:1px solid #1e293b; border-radius:999px; padding:8px 12px; font-size:12px; display:flex; gap:8px; align-items:center; }}
-.badge b {{ background:#1e293b; padding:4px 8px; border-radius:999px; font-weight:600; color:#cbd5e1; }}
-.ball {{ width:60px; height:60px; border-radius:999px; display:flex; align-items:center; justify-content:center; font-weight:700; font-size:18px; margin:8px; }}
-.ball.g {{ background:#16a34a22; border:1px solid #16a34a; color:#d1fae5; }}
-.ball.r {{ background:#ef444422; border:1px solid #ef4444; color:#fee2e2; }}
-table {{ width:100%; border-collapse:collapse; }}
-th,td {{ padding:10px; border-top:1px solid #1e293b; text-align:left; }}
-canvas {{ width:100%; height:260px; }}
-.muted {{ color:#94a3b8; font-size:12px; }}
-
-/* melhorias do “Custom” */
-.group {{
-  display:flex; align-items:center; gap:8px;
-  background:#0b1220; border:1px solid #1e293b; border-radius:12px; padding:6px 10px;
-}}
-.group label {{ font-size:12px; color:#94a3b8; margin-right:4px; }}
-.group .sep {{ color:#64748b; font-size:12px; padding:0 4px; }}
-.group input[type="date"] {{
-  border:none; padding:6px 8px; background:transparent; color:#e2e8f0; border-radius:8px;
-}}
-/* esconde o checkbox, mantendo funcionalidade */
-.hidden-check {{ position:absolute; opacity:0; width:1px; height:1px; pointer-events:none; }}
+:root { color-scheme: dark; }
+body { background:#0f172a; color:#e2e8f0; font-family: ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto; }
+.wrap { max-width:1024px; margin:24px auto; padding:0 16px; }
+.card { background:#0b1220; border:1px solid #1e293b; border-radius:12px; padding:16px; margin:16px 0; }
+.title { font-weight:700; font-size:18px; margin-bottom:8px; }
+.row { display:flex; gap:12px; align-items:center; flex-wrap:wrap; }
+input,select,button { background:#0b1220; color:#e2e8f0; border:1px solid #1e293b; border-radius:10px; padding:10px 12px; }
+button { cursor:pointer; }
+.pill { border-radius:999px; padding:10px 14px; border:1px solid #1e293b; display:inline-flex; gap:8px; align-items:center; }
+.badge { font-size:11px; background:#0b1220; border:1px solid #334155; border-radius:999px; padding:6px 10px; display:inline-flex; gap:8px; align-items:center; margin-right:10px; }
+.ball { width:60px; height:60px; border-radius:999px; display:flex; align-items:center; justify-content:center; font-weight:700; font-size:18px; margin:8px; }
+.ball.g { background:#16a34a22; border:1px solid #16a34a; color:#d1fae5; }
+.ball.r { background:#ef444422; border:1px solid #ef4444; color:#fee2e2; }
+table { width:100%; border-collapse:collapse; }
+th,td { padding:10px; border-top:1px solid #1e293b; text-align:left; }
+canvas { width:100%; height:260px; }
+.muted { color:#94a3b8; font-size:12px; }
 </style>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 </head>
@@ -729,36 +714,25 @@ canvas {{ width:100%; height:260px; }}
       <div>Janela</div>
       <select id="selWindow"></select>
       <script>
-      (function(){{
-        const sel = document.getElementById('selWindow');
-        for(let m=1;m<=12;m++){{const o=document.createElement('option');o.value=`${{m}}m`;o.textContent=m===1?'1 mês':`${{m}} meses`;if(m===3)o.selected=true;sel.appendChild(o);}}
+      (function(){ const sel = document.getElementById('selWindow');
+        for(let m=1;m<=12;m++){const o=document.createElement('option');o.value=`${m}m`;o.textContent=m===1?'1 mês':`${m} meses`;if(m===3)o.selected=true;sel.appendChild(o);}
         const all=document.createElement('option');all.value='all';all.textContent='Tudo';sel.appendChild(all);
-      }})();
+      })();
       </script>
-
-      <!-- Custom bonitinho -->
-      <div class="group">
-        <label>Custom</label>
-        <input id="inpStart" type="date" />
-        <span class="sep">até</span>
-        <input id="inpEnd" type="date" />
-      </div>
-
+      <div>Custom:</div>
+      <input id="inpStart" type="date" />
+      <input id="inpEnd" type="date" />
       <div>Pares</div><input id="inpEven" type="number" value="8" min="0" max="15" />
       <div>Ímpares</div><input id="inpOdd" type="number" value="7" min="0" max="15" />
-
-      <!-- checkbox oculto (força atualização), já marcado -->
-      <input id="chkForce" class="hidden-check" type="checkbox" checked />
-
+      <label class="row"><input id="chkForce" type="checkbox" checked />&nbsp;Atualizar</label>
       <button onclick="loadAll()">Atualizar</button>
     </div>
 
-    <!-- BADGES (sem “Método”) -->
-    <div class="badges" style="margin-top:12px;">
-      <div class="badge"><b>Atualizado</b><span id="bdUpdated">—</span></div>
-      <div class="badge"><b>Janela</b><span id="bdWindow">—</span></div>
-      <div class="badge"><b>Jogos</b><span id="bdGames">—</span></div>
-      <div class="badge"><b>Concurso mais atual</b><span id="bdLatest">—</span></div>
+    <div class="row" style="margin-top:10px">
+      <span class="badge"><b>Atualizado</b> <span id="bdupdated">–</span></span>
+      <span class="badge"><b>Janela</b> <span id="bdwindow">–</span></span>
+      <span class="badge"><b>Jogos</b> <span id="bdgames">–</span></span>
+      <span class="badge"><b>Concurso mais atual</b> <span id="bdlatest">–</span></span>
     </div>
   </div>
 
@@ -776,124 +750,91 @@ canvas {{ width:100%; height:260px; }}
     <table id="tbl"><thead><tr><th>Concurso</th><th>Data</th><th>Dezenas</th><th>Padrão</th></tr></thead><tbody></tbody></table>
   </div>
 
-  <div class="muted">Fonte: CAIXA · API pessoal · v{APP_VERSION}</div>
+  <div class="muted">Fonte: CAIXA · API pessoal · v{{APP_VERSION}}</div>
 </div>
 
 <script>
-async function j(url){{const r=await fetch(url);if(!r.ok)throw new Error('HTTP '+r.status);return r.json();}}
-function ball(n){{const c=(n%2===0)?'g':'r';return `<div class="ball ${{c}}">${{String(n).padStart(2,'0')}}</div>`;}}
-
-function formatPtBrDateTime(iso) {{
-  try {{
-    const d = new Date(iso.replace(' ', 'T'));
-    const f = new Intl.DateTimeFormat('pt-BR', {{
-      timeZone: 'America/Sao_Paulo',
-      year:'numeric', month:'2-digit', day:'2-digit',
-      hour:'2-digit', minute:'2-digit', second:'2-digit'
-    }});
-    return f.format(d) + ' (BRT)';
-  }} catch(e) {{ return iso || '—'; }}
-}}
-
-function fromNow(iso) {{
-  try {{
-    const d = new Date(iso.replace(' ', 'T'));
-    const diff = (Date.now() - d.getTime())/1000;
-    if (diff < 60) return `em ${{Math.max(1,Math.round(60-diff))}} segundo`;
-    const m = Math.round(diff/60);
-    if (m < 60) return `${{m}} minuto${{m>1?'s':''}} atrás`;
-    const h = Math.round(m/60);
-    return `${{h}} hora${{h>1?'s':''}} atrás`;
-  }} catch(e) {{ return ''; }}
-}}
-
-/      // helpers BR (datas e "há X tempo") -------------------------------
-      // Converte "YYYY-MM-DD" -> "DD-MM-YYYY"
-      function brDate(iso) {{
-        if (!iso) return '';
-        const [y, m, d] = iso.split('-');
-        return `${{d}}-${{m}}-${{y}}`;
-      }}
-
-      // Converte "DD/MM/YYYY HH:MM:SS" em Date (BR -> Date JS)
-      function parseBRDateTime(s) {{
-        if (!s) return null;
-        const [d, t = '00:00:00'] = s.split(' ');
-        const [dd, mm, yy] = d.split('/').map(Number);
-        const [hh, mi, ss] = t.split(':').map(Number);
-        return new Date(yy, (mm - 1), dd, hh, mi, ss || 0);
-      }}
-
-      // "há X segundos/minutos/horas"
-      function agoBR(s) {{
-        const dt = parseBRDateTime(s);
-        if (!dt) return '';
-        const diff = Math.max(0, (Date.now() - dt.getTime()) / 1000); // seg
-        if (diff < 60) {{
-          const v = Math.round(diff);
-          return `há ${{v}} segundo${{v !== 1 ? 's' : ''}}`;
-        }}
-        if (diff < 3600) {{
-          const v = Math.round(diff / 60);
-          return `há ${{v}} minuto${{v !== 1 ? 's' : ''}}`;
-        }}
-        const v = Math.round(diff / 3600);
-        return `há ${{v}} hora${{v !== 1 ? 's' : ''}}`;
-      }}
-      // -----------------------------------------------------------------
-
+// BR date helpers
+function fmtBR(iso){
+  if(!iso) return '—';
+  try{
+    const [y,m,d] = iso.split('-');
+    return `${d}-${m}-${y}`;
+  }catch(e){ return iso || '—'; }
+}
+// Convert "DD/MM/YYYY HH:MM:SS" string (BR) to Date
+function parseBRDateTime(s){
+  if(!s) return null;
+  const [d, t='00:00:00'] = s.split(' ');
+  const [dd, mm, yy] = d.split('/').map(Number);
+  const [hh, mi, ss] = t.split(':').map(Number);
+  return new Date(yy, (mm-1), dd, hh, mi, ss || 0);
+}
+// "há X ..." string in PT-BR
+function agoBR(s){
+  const dt = parseBRDateTime(s);
+  if(!dt) return '';
+  const diff = Math.max(0, (Date.now() - dt.getTime())/1000);
+  if(diff < 60){
+    const v = Math.round(diff);
+    return `há ${v} segundo${v!==1?'s':''}`;
+  }
+  if(diff < 3600){
+    const v = Math.round(diff/60);
+    return `há ${v} minuto${v!==1?'s':''}`;
+  }
+  const v = Math.round(diff/3600);
+  return `há ${v} hora${v!==1?'s':''}`;
+}
 
 let freqChart=null;
 
-
-async function loadAll(){{
+async function loadAll(){
   const w=document.getElementById('selWindow').value;
   const start=document.getElementById('inpStart').value;
   const end=document.getElementById('inpEnd').value;
   const E=document.getElementById('inpEven').value||8;
   const O=document.getElementById('inpOdd').value||7;
   const force=document.getElementById('chkForce').checked?'&force=true':'';
-  let url=`/parity?window=${{w}}&even=${{E}}&odd=${{O}}${{force}}`;
-  if(start||end) url=`/parity?even=${{E}}&odd=${{O}}${{start?`&start=${{start}}`:''}}${{end?`&end=${{end}}`:''}}${{force}}`;
+  let url=`/parity?window=${w}&even=${E}&odd=${O}${force}`;
+  if(start||end) url=`/parity?even=${E}&odd=${O}${start?`&start=${start}`:''}${end?`&end=${end}`:''}${force}`;
 
-  const [p,rdy] = await Promise.all([ j(url), j('/ready') ]);
+  const [p,rdy] = await Promise.all([ fetch(url).then(r=>r.json()), fetch('/ready').then(r=>r.json()) ]);
   const latest = rdy?.latest_contest ?? '—';
-  
-  
+
   // badges
   const updated = p.updated_at || '';
-  const ago = agoBR(updated);
-  document.getElementById('bdupdated').innerText =
-    `${{updated}}${{ago ? ' · ' + ago : ''}}`;
+  document.getElementById('bdupdated').innerText = `${updated}${updated?(' · '+agoBR(updated)) : ''}`;
+  document.getElementById('bdwindow').innerText = `${fmtBR(p.start||'')} → ${fmtBR(p.end||'')}`;
+  document.getElementById('bdgames').innerText = p.considered_games || 0;
+  document.getElementById('bdlatest').innerText = latest;
 
-  document.getElementById('bdwindow').innerText =
-    `${{isoToBRDash(p.start) || '—'}} → ${{isoToBRDash(p.end) || '—'}}`;
-
-
-  // sugestão
   const s=p.suggestion; document.getElementById('pillParidade').innerText = s.pattern+' (pares/ímpares)';
-  document.getElementById('suggBalls').innerHTML = s.combo.map(ball).join('');
+  document.getElementById('suggBalls').innerHTML = s.combo.map(n=>{
+    const c=(n%2===0)?'g':'r';
+    const t=String(n).padStart(2,'0');
+    return `<div class="ball ${c}">${t}</div>`;
+  }).join('');
 
-  // gráfico
   const labels=p.frequencies.map(x=>String(x.n).padStart(2,'0'));
   const data=p.frequencies.map(x=>x.count);
   if(freqChart) freqChart.destroy();
-  freqChart=new Chart(document.getElementById('chartFreq'), {{
-    type:'bar', data:{{labels,datasets:[{{label:'Frequência',data}}]}}, options:{{responsive:true,plugins:{{legend:{{display:false}}}}}}
-  }});
+  freqChart=new Chart(document.getElementById('chartFreq'), {
+    type:'bar', data:{labels,datasets:[{label:'Frequência',data}]}, options:{responsive:true,plugins:{legend:{display:false}}}
+  });
 
-  // últimos 10
-  const lotos=await j('/lotofacil?limit=10'); const tb=document.querySelector('#tbl tbody'); tb.innerHTML='';
-  for(const r of lotos.results){{
-    const pad=`${{r.even_count}}-${{r.odd_count}}`;
+  const lotos=await fetch('/lotofacil?limit=10').then(r=>r.json()); const tb=document.querySelector('#tbl tbody'); tb.innerHTML='';
+  for(const r of lotos.results){
+    const pad=`${r.even_count}-${r.odd_count}`;
     const nums=r.numbers.map(n=>String(n).padStart(2,'0')).join(' ');
-    tb.insertAdjacentHTML('beforeend', `<tr><td>${{r.contest}}</td><td>${{r.date||''}}</td><td>${{nums}}</td><td>${{pad}}</td></tr>`);
-  }}
-}}
+    tb.insertAdjacentHTML('beforeend', `<tr><td>${r.contest}</td><td>${r.date||''}</td><td>${nums}</td><td>${pad}</td></tr>`);
+  }
+}
 loadAll();
 </script>
-</body></html>
-""")
+</body></html>"""
+    return HTMLResponse(html.replace("{{APP_VERSION}}", APP_VERSION))
+
 
 
 @app.on_event("shutdown")
