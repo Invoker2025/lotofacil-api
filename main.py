@@ -1,4 +1,4 @@
-# Lotofacil API – v6.4.0
+# Lotofacil API – v6.5.0
 # - Coleta resultados da Lotofácil com 3 níveis:
 #     1) Mirror público (opcionalmente preferido)
 #     2) JSON oficial (Portal de Loterias CAIXA)
@@ -19,7 +19,7 @@ from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
-APP_VERSION = "6.4.0"
+APP_VERSION = "6.5.0"
 
 # --- Origens CAIXA (JSON oficial) ---
 CAIXA_HOSTS = [
@@ -129,11 +129,6 @@ def _agg_put(payload: Dict[str, Any], kind: str, **params):
 # ------------------------------------------------------------------------------
 # Utils
 # ------------------------------------------------------------------------------
-
-
-async def _sleep_ms(ms: int):
-    import asyncio
-    await asyncio.sleep(ms/1000.0)
 
 
 def parse_draw_date(s: str) -> Optional[dt.date]:
@@ -677,40 +672,128 @@ async def parity(
 
 @app.get("/app", response_class=HTMLResponse)
 async def ui():
-    html = """<!doctype html>
+    html = f"""<!doctype html>
 <html lang="pt-br">
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Lotofácil</title>
 <style>
-:root { color-scheme: dark; }
-body { background:#0f172a; color:#e2e8f0; font-family: ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto; }
-.wrap { max-width:1024px; margin:24px auto; padding:0 16px; }
-.card { background:#0b1220; border:1px solid #1e293b; border-radius:12px; padding:16px; margin:16px 0; }
-.title { font-weight:700; font-size:18px; margin-bottom:8px; }
-.row { display:flex; gap:12px; align-items:center; flex-wrap:wrap; }
-input,select,button { background:#0b1220; color:#e2e8f0; border:1px solid #1e293b; border-radius:10px; padding:10px 12px; }
-button { cursor:pointer; }
-.pill { border-radius:999px; padding:10px 14px; border:1px solid #1e293b; display:inline-flex; gap:8px; align-items:center; }
-.badge { font-size:11px; background:#0b1220; border:1px solid #334155; border-radius:999px; padding:6px 10px; display:inline-flex; gap:8px; align-items:center; margin-right:10px; }
-.ball { width:60px; height:60px; border-radius:999px; display:flex; align-items:center; justify-content:center; font-weight:700; font-size:18px; margin:8px; }
-.ball.g { background:#16a34a22; border:1px solid #16a34a; color:#d1fae5; }
-.ball.r { background:#ef444422; border:1px solid #ef4444; color:#fee2e2; }
-table { width:100%; border-collapse:collapse; }
-th,td { padding:10px; border-top:1px solid #1e293b; text-align:left; }
-canvas { width:100%; height:260px; }
-.muted { color:#94a3b8; font-size:12px; }
+:root {{ color-scheme: dark; }}
+body {{ background:#0f172a; color:#e2e8f0; font-family: ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto; }}
+.wrap {{ max-width:1024px; margin:24px auto; padding:0 16px; }}
+.card {{ background:#0b1220; border:1px solid #1e293b; border-radius:12px; padding:16px; margin:16px 0; }}
+.title {{ font-weight:700; font-size:18px; margin-bottom:8px; }}
+.row {{ display:flex; gap:12px; align-items:center; flex-wrap:wrap; }}
+input,select,button {{ background:#0b1220; color:#e2e8f0; border:1px solid #1e293b; border-radius:10px; padding:10px 12px; }}
+button {{ cursor:pointer; }}
+.badge {{ font-size:11px; background:#0b1220; border:1px solid #334155; border-radius:999px; padding:6px 10px; display:inline-flex; gap:8px; align-items:center; margin-right:10px; }}
+.pill {{ border-radius:999px; padding:10px 14px; border:1px solid #1e293b; display:inline-flex; gap:8px; align-items:center; }}
+.ball {{ width:60px; height:60px; border-radius:999px; display:flex; align-items:center; justify-content:center; font-weight:700; font-size:18px; margin:8px; }}
+.ball.g {{ background:#16a34a22; border:1px solid #16a34a; color:#d1fae5; }}
+.ball.r {{ background:#ef444422; border:1px solid #ef4444; color:#fee2e2; }}
+table {{ width:100%; border-collapse:collapse; }}
+th,td {{ padding:10px; border-top:1px solid #1e293b; text-align:left; }}
+canvas {{ width:100%; height:260px; }}
+.muted {{ color:#94a3b8; font-size:12px; }}
+
+/* botão com spinner */
+.btn {{ position:relative; display:inline-flex; align-items:center; gap:10px; }}
+.spin {{
+  width:14px; height:14px; border:2px solid #94a3b8; border-top-color:#e2e8f0;
+  border-radius:999px; animation:spin 0.8s linear infinite;
+}}
+.hidden {{ display:none; }}
+@keyframes spin {{ to {{ transform:rotate(360deg); }} }}
+</style>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+</head>
+<body>
+<div class="wrap">
+  <h2>Lotofácil</h2>
+
+  <div class="card">
+    <div class="row">
+      <div>Janela</div>
+      <select id="selWindow"></select>
+
+      <div>Custom:</div>
+      <input id="inpStart" type="date" />
+      <input id="inpEnd"   type="date"  />
+      <div>Pares</div><input id="inpEven" type="number" value="8" min="0" max="15" />
+      <div>Ímpares</div><input id="inpOdd"  type="number" value="7" min="0" max="15" />
+      <button id="btnRefresh" class="btn" type="button" onclick="loadAll(true)">
+        <span id="spin" class="spin hidden" aria-hidden="true"></span>
+        <span id="btnText">Atualizar</span>
+      </button>
+    </div>
+
+    <div class="row" style="margin-top:10px">
+      <span class="badge"><b>Atualizado</b> <span id="bdupdated">–</span></span>
+      <span class="badge"><b>Janela</b>     <span id="bdwindow">–</span></span>
+      <span class="badge"><b>Jogos</b>      <span id="bdgames">–</span></span>
+      <span class="badge"><b>Concurso mais atual</b> <span id="bdlatest">–</span></span>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="row" style="justify-content:space-between;">
+      <div class="title">Combinação sugerida <span class="pill" id="pillParidade">8-7 (pares/ímpares)</span></div>
+    </div>
+    <div id="suggBalls" class="row"></div>
+  </div>
+
+  <div class="card"><div class="title">Frequência por dezena (na janela)</div><canvas id="chartFreq"></canvas></div>
+
+  <div class="card">
+    <div class="title">Amostra (10 últimos)</div>
+    <table id="tbl"><thead><tr><th>Concurso</th><th>Data</th><th>Dezenas</th><th>Padrão</th></tr></thead><tbody></tbody></table>
+  </div>
+
+  <div class="muted">Fonte: CAIXA · API pessoal · v{APP_VERSION}</div>
+</div>
+
+<script>
+// Helpers de data em PT-BR
+function fmtBRfromISO(iso){
+  if(!iso) return '—';
+  try{ const [y,m,d] = iso.split('-'); return `${d}-${m}-${y}`; }catch(e){ return iso; }
+}
+function parseBRDateTime(s){
+  if(!s) return null;
+  const [d, t='00:00:00'] = s.split(' ');
+  const [dd, mm, yy] = d.split('/').map(Number);
+  const [hh, mi, ss] = t.split(':').map(Number);
+  return new Date(yy, (mm-1), dd, hh, mi, ss || 0);
+}
+function agoBR(s){
+  const dt = parseBRDateTime(s);
+  if(!dt) return '';
+  const diff = Math.max(0, (Date.now() - dt.getTime())/1000);
+  if(diff < 60){ const v = Math.round(diff); return `há ${v} segundo${v!==1?'s':''}`; }
+  if(diff < 3600){ const v = Math.round(diff/60); return `há ${v} minuto${v!==1?'s':''}`; }
+  const v = Math.round(diff/3600); return `há ${v} hora${v!==1?'s':''}`;
+}
+
+// UI loading
+function setLoading(on){
+  const b = document.getElementById('btnRefresh');
+  const sp= document.getElementById('spin');
+  const tx= document.getElementById('btnText');
+  if(on){ sp.classList.remove('hidden'); tx.textContent='Atualizando…'; b.disabled=true; }
+  else { sp.classList.add('hidden');    tx.textContent='Atualizar';     b.disabled=false; }
+}
+
 let freqChart = null;
 
 async function loadAll(manual=false){
   setLoading(true);
   try{
-    const w    = document.getElementById('selWindow').value;
-    const start= document.getElementById('inpStart').value;
-    const end  = document.getElementById('inpEnd').value;
-    const E    = document.getElementById('inpEven').value || 8;
-    const O    = document.getElementById('inpOdd').value  || 7;
+    const w     = document.getElementById('selWindow').value;
+    const start = document.getElementById('inpStart').value;
+    const end   = document.getElementById('inpEnd').value;
+    const E     = document.getElementById('inpEven').value || 8;
+    const O     = document.getElementById('inpOdd').value  || 7;
 
     const force = manual ? '&force=true' : '';
     let url = `/parity?window=${w}&even=${E}&odd=${O}${force}`;
@@ -724,11 +807,11 @@ async function loadAll(manual=false){
     ]);
 
     // badges
-    const updated = formatBrDateTime(p.updated_at || '');
+    const updated = p.updated_at || '';
     document.getElementById('bdupdated').innerText =
-      `${updated} · ${agoBR(p.updated_at || '')}`;
+      `${updated}${updated?(' · '+agoBR(updated)) : ''}`;
     document.getElementById('bdwindow').innerText =
-      `${p.start?.split('-').reverse().join('-') || '—'} → ${p.end?.split('-').reverse().join('-') || '—'}`;
+      `${fmtBRfromISO(p.start||'')} → ${fmtBRfromISO(p.end||'')}`;
     document.getElementById('bdgames').innerText  = p.considered_games ?? '0';
     document.getElementById('bdlatest').innerText = rdy?.latest_contest ?? '—';
 
@@ -778,141 +861,11 @@ async function loadAll(manual=false){
   }
   const all = document.createElement('option'); all.value='all'; all.textContent='Tudo';
   sel.appendChild(all);
-  // primeira carga
   loadAll(false);
 })();
-</style>
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
-</head>
-<body>
-<div class="wrap">
-  <h2>Lotofácil</h2>
-
-  <div class="card">
-    <div class="row">
-      <div>Janela</div>
-      <select id="selWindow"></select>
-      <script>
-      (function(){ const sel = document.getElementById('selWindow');
-        for(let m=1;m<=12;m++){const o=document.createElement('option');o.value=`${m}m`;o.textContent=m===1?'1 mês':`${m} meses`;if(m===3)o.selected=true;sel.appendChild(o);}
-        const all=document.createElement('option');all.value='all';all.textContent='Tudo';sel.appendChild(all);
-      })();
-      </script>
-      <div>Custom:</div>
-      <input id="inpStart" type="date" />
-      <input id="inpEnd" type="date" />
-      <div>Pares</div><input id="inpEven" type="number" value="8" min="0" max="15" />
-      <div>Ímpares</div><input id="inpOdd" type="number" value="7" min="0" max="15" />
-      <label class="row"><input id="chkForce" type="checkbox" checked />&nbsp;Atualizar</label>
-      <button onclick="loadAll()">Atualizar</button>
-    </div>
-
-    <div class="row" style="margin-top:10px">
-      <span class="badge"><b>Atualizado</b> <span id="bdupdated">–</span></span>
-      <span class="badge"><b>Janela</b> <span id="bdwindow">–</span></span>
-      <span class="badge"><b>Jogos</b> <span id="bdgames">–</span></span>
-      <span class="badge"><b>Concurso mais atual</b> <span id="bdlatest">–</span></span>
-    </div>
-  </div>
-
-  <div class="card">
-    <div class="row" style="justify-content:space-between;">
-      <div class="title">Combinação sugerida <span class="pill" id="pillParidade">8-7 (pares/ímpares)</span></div>
-    </div>
-    <div id="suggBalls" class="row"></div>
-  </div>
-
-  <div class="card"><div class="title">Frequência por dezena (na janela)</div><canvas id="chartFreq"></canvas></div>
-
-  <div class="card">
-    <div class="title">Amostra (10 últimos)</div>
-    <table id="tbl"><thead><tr><th>Concurso</th><th>Data</th><th>Dezenas</th><th>Padrão</th></tr></thead><tbody></tbody></table>
-  </div>
-
-  <div class="muted">Fonte: CAIXA · API pessoal · v{{APP_VERSION}}</div>
-</div>
-
-<script>
-// BR date helpers
-function fmtBR(iso){
-  if(!iso) return '—';
-  try{
-    const [y,m,d] = iso.split('-');
-    return `${d}-${m}-${y}`;
-  }catch(e){ return iso || '—'; }
-}
-// Convert "DD/MM/YYYY HH:MM:SS" string (BR) to Date
-function parseBRDateTime(s){
-  if(!s) return null;
-  const [d, t='00:00:00'] = s.split(' ');
-  const [dd, mm, yy] = d.split('/').map(Number);
-  const [hh, mi, ss] = t.split(':').map(Number);
-  return new Date(yy, (mm-1), dd, hh, mi, ss || 0);
-}
-// "há X ..." string in PT-BR
-function agoBR(s){
-  const dt = parseBRDateTime(s);
-  if(!dt) return '';
-  const diff = Math.max(0, (Date.now() - dt.getTime())/1000);
-  if(diff < 60){
-    const v = Math.round(diff);
-    return `há ${v} segundo${v!==1?'s':''}`;
-  }
-  if(diff < 3600){
-    const v = Math.round(diff/60);
-    return `há ${v} minuto${v!==1?'s':''}`;
-  }
-  const v = Math.round(diff/3600);
-  return `há ${v} hora${v!==1?'s':''}`;
-}
-
-let freqChart=null;
-
-async function loadAll(){
-  const w=document.getElementById('selWindow').value;
-  const start=document.getElementById('inpStart').value;
-  const end=document.getElementById('inpEnd').value;
-  const E=document.getElementById('inpEven').value||8;
-  const O=document.getElementById('inpOdd').value||7;
-  const force=document.getElementById('chkForce').checked?'&force=true':'';
-  let url=`/parity?window=${w}&even=${E}&odd=${O}${force}`;
-  if(start||end) url=`/parity?even=${E}&odd=${O}${start?`&start=${start}`:''}${end?`&end=${end}`:''}${force}`;
-
-  const [p,rdy] = await Promise.all([ fetch(url).then(r=>r.json()), fetch('/ready').then(r=>r.json()) ]);
-  const latest = rdy?.latest_contest ?? '—';
-
-  // badges
-  const updated = p.updated_at || '';
-  document.getElementById('bdupdated').innerText = `${updated}${updated?(' · '+agoBR(updated)) : ''}`;
-  document.getElementById('bdwindow').innerText = `${fmtBR(p.start||'')} → ${fmtBR(p.end||'')}`;
-  document.getElementById('bdgames').innerText = p.considered_games || 0;
-  document.getElementById('bdlatest').innerText = latest;
-
-  const s=p.suggestion; document.getElementById('pillParidade').innerText = s.pattern+' (pares/ímpares)';
-  document.getElementById('suggBalls').innerHTML = s.combo.map(n=>{
-    const c=(n%2===0)?'g':'r';
-    const t=String(n).padStart(2,'0');
-    return `<div class="ball ${c}">${t}</div>`;
-  }).join('');
-
-  const labels=p.frequencies.map(x=>String(x.n).padStart(2,'0'));
-  const data=p.frequencies.map(x=>x.count);
-  if(freqChart) freqChart.destroy();
-  freqChart=new Chart(document.getElementById('chartFreq'), {
-    type:'bar', data:{labels,datasets:[{label:'Frequência',data}]}, options:{responsive:true,plugins:{legend:{display:false}}}
-  });
-
-  const lotos=await fetch('/lotofacil?limit=10').then(r=>r.json()); const tb=document.querySelector('#tbl tbody'); tb.innerHTML='';
-  for(const r of lotos.results){
-    const pad=`${r.even_count}-${r.odd_count}`;
-    const nums=r.numbers.map(n=>String(n).padStart(2,'0')).join(' ');
-    tb.insertAdjacentHTML('beforeend', `<tr><td>${r.contest}</td><td>${r.date||''}</td><td>${nums}</td><td>${pad}</td></tr>`);
-  }
-}
-loadAll();
 </script>
 </body></html>"""
-    return HTMLResponse(html.replace("{{APP_VERSION}}", APP_VERSION))
+    return HTMLResponse(html)
 
 
 @app.on_event("shutdown")
