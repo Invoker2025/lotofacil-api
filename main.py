@@ -6,6 +6,7 @@
 # - UI simples em /app, /ready mostra latest_contest, sem Chromium.
 
 from __future__ import annotations
+from fastapi.responses import HTMLResponse
 
 import os
 import re
@@ -672,39 +673,39 @@ async def parity(
 
 @app.get("/app", response_class=HTMLResponse)
 async def ui():
-    html = f"""<!doctype html>
+    html = """<!doctype html>
 <html lang="pt-br">
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Lotofácil</title>
 <style>
-:root {{ color-scheme: dark; }}
-body {{ background:#0f172a; color:#e2e8f0; font-family: ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto; }}
-.wrap {{ max-width:1024px; margin:24px auto; padding:0 16px; }}
-.card {{ background:#0b1220; border:1px solid #1e293b; border-radius:12px; padding:16px; margin:16px 0; }}
-.title {{ font-weight:700; font-size:18px; margin-bottom:8px; }}
-.row {{ display:flex; gap:12px; align-items:center; flex-wrap:wrap; }}
-input,select,button {{ background:#0b1220; color:#e2e8f0; border:1px solid #1e293b; border-radius:10px; padding:10px 12px; }}
-button {{ cursor:pointer; }}
-.badge {{ font-size:11px; background:#0b1220; border:1px solid #334155; border-radius:999px; padding:6px 10px; display:inline-flex; gap:8px; align-items:center; margin-right:10px; }}
-.pill {{ border-radius:999px; padding:10px 14px; border:1px solid #1e293b; display:inline-flex; gap:8px; align-items:center; }}
-.ball {{ width:60px; height:60px; border-radius:999px; display:flex; align-items:center; justify-content:center; font-weight:700; font-size:18px; margin:8px; }}
-.ball.g {{ background:#16a34a22; border:1px solid #16a34a; color:#d1fae5; }}
-.ball.r {{ background:#ef444422; border:1px solid #ef4444; color:#fee2e2; }}
-table {{ width:100%; border-collapse:collapse; }}
-th,td {{ padding:10px; border-top:1px solid #1e293b; text-align:left; }}
-canvas {{ width:100%; height:260px; }}
-.muted {{ color:#94a3b8; font-size:12px; }}
+:root { color-scheme: dark; }
+body { background:#0f172a; color:#e2e8f0; font-family: ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto; }
+.wrap { max-width:1024px; margin:24px auto; padding:0 16px; }
+.card { background:#0b1220; border:1px solid #1e293b; border-radius:12px; padding:16px; margin:16px 0; }
+.title { font-weight:700; font-size:18px; margin-bottom:8px; }
+.row { display:flex; gap:12px; align-items:center; flex-wrap:wrap; }
+input,select,button { background:#0b1220; color:#e2e8f0; border:1px solid #1e293b; border-radius:10px; padding:10px 12px; }
+button { cursor:pointer; }
+.badge { font-size:11px; background:#0b1220; border:1px solid #334155; border-radius:999px; padding:6px 10px; display:inline-flex; gap:8px; align-items:center; margin-right:10px; }
+.pill { border-radius:999px; padding:10px 14px; border:1px solid #1e293b; display:inline-flex; gap:8px; align-items:center; }
+.ball { width:60px; height:60px; border-radius:999px; display:flex; align-items:center; justify-content:center; font-weight:700; font-size:18px; margin:8px; }
+.ball.g { background:#16a34a22; border:1px solid #16a34a; color:#d1fae5; }
+.ball.r { background:#ef444422; border:1px solid #ef4444; color:#fee2e2; }
+table { width:100%; border-collapse:collapse; }
+th,td { padding:10px; border-top:1px solid #1e293b; text-align:left; }
+canvas { width:100%; height:260px; }
+.muted { color:#94a3b8; font-size:12px; }
 
 /* botão com spinner */
-.btn {{ position:relative; display:inline-flex; align-items:center; gap:10px; }}
-.spin {{
+.btn { position:relative; display:inline-flex; align-items:center; gap:10px; }
+.spin {
   width:14px; height:14px; border:2px solid #94a3b8; border-top-color:#e2e8f0;
   border-radius:999px; animation:spin 0.8s linear infinite;
-}}
-.hidden {{ display:none; }}
-@keyframes spin {{ to {{ transform:rotate(360deg); }} }}
+}
+.hidden { display:none; }
+@keyframes spin { to { transform:rotate(360deg); } }
 </style>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 </head>
@@ -849,7 +850,7 @@ async function loadAll(manual=false){
   }
 }
 
-// popula seletor de janela e faz a 1ª carga (sem force)
+// popula seletor e faz a 1ª carga
 (function(){
   const sel = document.getElementById('selWindow');
   for(let m=1; m<=12; m++){
@@ -865,7 +866,8 @@ async function loadAll(manual=false){
 })();
 </script>
 </body></html>"""
-    return HTMLResponse(html)
+    # injeta apenas a versão, sem usar f-string
+    return HTMLResponse(html.replace("{APP_VERSION}", APP_VERSION))
 
 
 @app.on_event("shutdown")
