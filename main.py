@@ -799,7 +799,7 @@ function fromNow(iso) {{
   try {{
     const d = new Date(iso.replace(' ', 'T'));
     const diff = (Date.now() - d.getTime())/1000;
-    if (diff < 60) return `em ${Math.max(1,Math.round(60-diff))} segundo`;
+    if (diff < 60) return `em ${{Math.max(1,Math.round(60-diff))}} segundo`;
     const m = Math.round(diff/60);
     if (m < 60) return `${{m}} minuto${{m>1?'s':''}} atrás`;
     const h = Math.round(m/60);
