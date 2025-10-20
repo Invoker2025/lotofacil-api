@@ -688,18 +688,34 @@ async def ui():
 :root {{ color-scheme: dark; }}
 body {{ background:#0f172a; color:#e2e8f0; font-family: ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto; }}
 .wrap {{ max-width:1024px; margin:24px auto; padding:0 16px; }}
+
+/* cards e inputs */
 .card {{ background:#0b1220; border:1px solid #1e293b; border-radius:12px; padding:16px; margin:16px 0; }}
 .title {{ font-weight:700; font-size:18px; margin-bottom:8px; }}
 .row {{ display:flex; gap:12px; align-items:center; flex-wrap:wrap; }}
 input,select,button {{ background:#0b1220; color:#e2e8f0; border:1px solid #1e293b; border-radius:10px; padding:10px 12px; }}
 button {{ cursor:pointer; }}
+button.primary {{ background:#3b82f6; border-color:#3b82f6; }}
 .pill {{ border-radius:999px; padding:10px 14px; border:1px solid #1e293b; }}
+
+/* bolas */
 .ball {{ width:60px; height:60px; border-radius:999px; display:flex; align-items:center; justify-content:center; font-weight:700; font-size:18px; margin:8px; }}
 .ball.g {{ background:#16a34a22; border:1px solid #16a34a; color:#d1fae5; }}
 .ball.r {{ background:#ef444422; border:1px solid #ef4444; color:#fee2e2; }}
+
+/* tabela / canvas */
 table {{ width:100%; border-collapse:collapse; }}
 th,td {{ padding:10px; border-top:1px solid #1e293b; text-align:left; }}
 canvas {{ width:100%; height:260px; }}
+
+/* barra de status com badges */
+.meta {{ margin-top:8px; display:flex; gap:8px; flex-wrap:wrap; font-size:13px; color:#94a3b8; }}
+.badge {{
+  display:inline-flex; align-items:center; gap:6px;
+  padding:6px 10px; border-radius:999px; background:#111827;
+  border:1px solid #1f2937; color:#cbd5e1;
+}}
+.badge b {{ color:#e5e7eb; }}
 .muted {{ color:#94a3b8; font-size:12px; }}
 </style>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
@@ -713,7 +729,8 @@ canvas {{ width:100%; height:260px; }}
       <div>Janela</div>
       <select id="selWindow"></select>
       <script>
-      (function(){{ const sel = document.getElementById('selWindow');
+      (function(){{
+        const sel = document.getElementById('selWindow');
         for(let m=1;m<=12;m++){{const o=document.createElement('option');o.value=`${{m}}m`;o.textContent=m===1?'1 mês':`${{m}} meses`;if(m===3)o.selected=true;sel.appendChild(o);}}
         const all=document.createElement('option');all.value='all';all.textContent='Tudo';sel.appendChild(all);
       }})();
@@ -723,10 +740,13 @@ canvas {{ width:100%; height:260px; }}
       <input id="inpEnd" type="date" />
       <div>Pares</div><input id="inpEven" type="number" value="8" min="0" max="15" />
       <div>Ímpares</div><input id="inpOdd" type="number" value="7" min="0" max="15" />
-      <label class="row"><input id="chkForce" type="checkbox" />&nbsp;Forçar atualização</label>
-      <button onclick="loadAll()">Atualizar</button>
+      <!-- Agora marcado por padrão -->
+      <label class="row"><input id="chkForce" type="checkbox" checked />&nbsp;Forçar atualização</label>
+      <button class="primary" onclick="loadAll()">Atualizar</button>
     </div>
-    <div class="muted" id="meta"></div>
+
+    <!-- barra de status com badges -->
+    <div class="meta" id="meta"></div>
   </div>
 
   <div class="card">
@@ -743,13 +763,65 @@ canvas {{ width:100%; height:260px; }}
     <table id="tbl"><thead><tr><th>Concurso</th><th>Data</th><th>Dezenas</th><th>Padrão</th></tr></thead><tbody></tbody></table>
   </div>
 
-  <div class="muted">Fonte: CAIXA · API pessoal · v{APP_VERSION}</div>
+  <div class="muted">Fonte: CAIXA · API pessoal · v6.4.1</div>
 </div>
 
 <script>
+/* ===== helpers de data/hora PT-BR ===== */
+const TZ = 'America/Sao_Paulo';
+const fmtDateTime = (d) => new Intl.DateTimeFormat('pt-BR', {{
+  timeZone: TZ, year:'numeric', month:'2-digit', day:'2-digit',
+  hour:'2-digit', minute:'2-digit', second:'2-digit'
+}}).format(d);
+
+const rel = new Intl.RelativeTimeFormat('pt-BR', {{ numeric:'auto' }});
+function relativeFrom(now, past) {{
+  const diff = Math.round((past - now)/1000); // negativo = passado
+  const abs = Math.abs(diff);
+  if (abs < 60)  return rel.format(Math.sign(diff)*Math.round(abs), 'second');
+  const m = Math.round(abs/60); if (m < 60) return rel.format(Math.sign(diff)*m, 'minute');
+  const h = Math.round(m/60);   if (h < 24) return rel.format(Math.sign(diff)*h, 'hour');
+  const d = Math.round(h/24);   return rel.format(Math.sign(diff)*d, 'day');
+}}
+
+// tenta parsear "dd/mm/aaaa HH:MM:SS"
+function parseBrDate(s) {{
+  if (!s) return null;
+  try {{
+    const [d,t] = s.split(' ');
+    const [dd,mm,yy] = d.split('/').map(n=>parseInt(n,10));
+    const [hh,mi,ss] = (t||'00:00:00').split(':').map(n=>parseInt(n,10));
+    // Data criada como UTC, exibida em TZ Brasil pelo Intl
+    return new Date(Date.UTC(yy, (mm||1)-1, dd||1, hh||0, mi||0, ss||0));
+  }} catch(e) {{ return null; }}
+}}
+
 async function j(url){{const r=await fetch(url);if(!r.ok)throw new Error('HTTP '+r.status);return r.json();}}
 function ball(n){{const c=(n%2===0)?'g':'r';return `<div class="ball ${{c}}">${{String(n).padStart(2,'0')}}</div>`;}}
 let freqChart=null;
+
+function setMeta(parity, ready, latestList){{
+  const meta = document.getElementById('meta');
+  const now = new Date();
+  const upd = parseBrDate(parity.updated_at) || now;
+  const updatedFmt = fmtDateTime(upd);
+  const tz = new Intl.DateTimeFormat('pt-BR', {{timeZoneName:'short', timeZone:TZ}}).format(upd).split(' ').pop();
+  const relTxt = relativeFrom(now, upd);
+
+  const method = (parity.method||'n/a').toLowerCase();
+  const games = parity.considered_games ?? 0;
+  const start = parity.start || '—';
+  const end   = parity.end   || '—';
+  const latestContest = (ready?.latest_contest ?? latestList?.[0]?.contest) || '—';
+
+  meta.innerHTML = `
+    <span class="badge"><b>Método</b> ${{method}}</span>
+    <span class="badge"><b>Atualizado</b> ${{updatedFmt}} (${{tz}}) · ${{relTxt}}</span>
+    <span class="badge"><b>Janela</b> ${{start}} → ${{end}}</span>
+    <span class="badge"><b>Jogos</b> ${{games}}</span>
+    <span class="badge"><b>Concurso mais atual</b> ${{latestContest}}</span>
+  `;
+}}
 
 async function loadAll(){{
   const w=document.getElementById('selWindow').value;
@@ -761,26 +833,30 @@ async function loadAll(){{
   let url=`/parity?window=${{w}}&even=${{E}}&odd=${{O}}${{force}}`;
   if(start||end) url=`/parity?even=${{E}}&odd=${{O}}${{start?`&start=${{start}}`:''}}${{end?`&end=${{end}}`:''}}${{force}}`;
 
-  const [p,rdy] = await Promise.all([ j(url), j('/ready') ]);
-  const latest = rdy?.latest_contest ?? '—';
-  document.getElementById('meta').innerText =
-    `método: ${{p.method}} · Atualizado: ${{p.updated_at}} · jogos considerados: ${{p.considered_games}} · `+
-    `janela: ${{p.start||'—'}} → ${{p.end||'—'}} · concurso mais atual: ${{latest}}`;
+  const [p,rdy,lotos] = await Promise.all([ j(url), j('/ready'), j('/lotofacil?limit=10') ]);
 
+  // status bonito
+  setMeta(p, rdy, lotos.results||[]);
+
+  // combinação sugerida
   const s=p.suggestion; document.getElementById('pillParidade').innerText = s.pattern+' (pares/ímpares)';
   document.getElementById('suggBalls').innerHTML = s.combo.map(ball).join('');
 
+  // gráfico
   const labels=p.frequencies.map(x=>String(x.n).padStart(2,'0'));
   const data=p.frequencies.map(x=>x.count);
   if(freqChart) freqChart.destroy();
   freqChart=new Chart(document.getElementById('chartFreq'), {{
-    type:'bar', data:{{labels,datasets:[{{label:'Frequência',data}}]}}, options:{{responsive:true,plugins:{{legend:{{display:false}}}}}}
+    type:'bar',
+    data:{{labels,datasets:[{{label:'Frequência',data,backgroundColor:'#3b82f6'}}]}},
+    options:{{responsive:true,plugins:{{legend:{{display:false}}}}}}
   }});
 
-  const lotos=await j('/lotofacil?limit=10'); const tb=document.querySelector('#tbl tbody'); tb.innerHTML='';
-  for(const r of lotos.results){{
+  // tabela últimos
+  const tb=document.querySelector('#tbl tbody'); tb.innerHTML='';
+  for(const r of (lotos.results||[])){{
     const pad=`${{r.even_count}}-${{r.odd_count}}`;
-    const nums=r.numbers.map(n=>String(n).padStart(2,'0')).join(' ');
+    const nums=(r.numbers||[]).map(n=>String(n).padStart(2,'0')).join(' ');
     tb.insertAdjacentHTML('beforeend', `<tr><td>${{r.contest}}</td><td>${{r.date||''}}</td><td>${{nums}}</td><td>${{pad}}</td></tr>`);
   }}
 }}
