@@ -1,8 +1,9 @@
-# Lotofacil API – v6.3.1
-# - Fonte primária: CAIXA (HTTP JSON). Fallback: mirror público (somente leitura).
-# - Flag PREFER_MIRROR=1 faz tentar o mirror primeiro (bom para Render Free).
-# - Janela 1..12m, "all" ou datas customizadas (start/end).
-# - /app mostra "concurso mais atual" e a combinação 8-7 (pares/ímpares) por padrão.
+# Lotofacil API – v6.4.0
+# - Coleta resultados da Lotofácil com 3 níveis:
+#     1) Mirror público (opcionalmente preferido)
+#     2) JSON oficial (Portal de Loterias CAIXA)
+#     3) HTML oficial (página de resultados: scraping tolerante)
+# - UI simples em /app, /ready mostra latest_contest, sem Chromium.
 
 from __future__ import annotations
 
@@ -18,35 +19,29 @@ from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
-# ------------------------------------------------------------------------------
-# Config
-# ------------------------------------------------------------------------------
-APP_VERSION = "6.3.1"
+APP_VERSION = "6.4.0"
 
+# --- Origens CAIXA (JSON oficial) ---
 CAIXA_HOSTS = [
     "https://servicebus2.caixa.gov.br/portaldeloterias/api/lotofacil",
     "https://loterias.caixa.gov.br/portaldeloterias/api/lotofacil",
 ]
 
-# Fallback (mirror público somente leitura)
+# --- Página oficial (HTML) para scraping ---
+CAIXA_HTML_URLS = [
+    "https://loterias.caixa.gov.br/Paginas/Lotofacil.aspx",
+    # tentativa direta com query
+    "https://loterias.caixa.gov.br/Paginas/Lotofacil.aspx?concurso={n}",
+]
+
+# --- Mirror público (somente leitura) ---
 MIRROR_LATEST = "https://loteriascaixa-api.herokuapp.com/api/lotofacil/latest"
 MIRROR_BY_ID = "https://loteriascaixa-api.herokuapp.com/api/lotofacil/{n}"
 
-HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "12"))     # segs
-# não usado no serial; legado
-BATCH_SIZE = int(os.getenv("BATCH_SIZE", "20"))
-AGG_TTL_SEC = int(os.getenv("AGG_TTL_SEC", "120"))     # cache dos agregados
-# cache de chamadas CAIXA/mirror
+HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "12"))
+AGG_TTL_SEC = int(os.getenv("AGG_TTL_SEC", "120"))
 CAIXA_TTL_SEC = int(os.getenv("CAIXA_TTL_SEC", "120"))
-# tentar mirror primeiro?
 PREFER_MIRROR = os.getenv("PREFER_MIRROR", "0") == "1"
-
-# ------------------------------------------------------------------------------
-# Estado global
-# ------------------------------------------------------------------------------
-_http: httpx.AsyncClient | None = None
-_caixa_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}  # key->(ts,json)
-_agg_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}  # key->(ts,payload)
 
 # ------------------------------------------------------------------------------
 # App
@@ -61,10 +56,12 @@ app.add_middleware(
 # ------------------------------------------------------------------------------
 # HTTP client
 # ------------------------------------------------------------------------------
+_http: httpx.AsyncClient | None = None
+_caixa_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+_agg_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
 
 
 async def ensure_http() -> httpx.AsyncClient:
-    """Client httpx com headers próximos do site oficial."""
     global _http
     if _http is None:
         _http = httpx.AsyncClient(
@@ -73,14 +70,14 @@ async def ensure_http() -> httpx.AsyncClient:
                 "user-agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                                "AppleWebKit/537.36 (KHTML, like Gecko) "
                                "Chrome/120.0.0.0 Safari/537.36"),
-                "accept": "application/json, text/plain, */*",
+                "accept": "text/html,application/json;q=0.9,*/*;q=0.8",
                 "accept-language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
-                "x-requested-with": "XMLHttpRequest",
-                "referer": "https://loterias.caixa.gov.br/wps/portal/loterias/landing/lotofacil",
-                "origin": "https://loterias.caixa.gov.br",
                 "pragma": "no-cache",
                 "cache-control": "no-cache",
+                "referer": "https://loterias.caixa.gov.br/Paginas/Lotofacil.aspx",
+                "origin": "https://loterias.caixa.gov.br",
             },
+            follow_redirects=True,
         )
     return _http
 
@@ -94,7 +91,7 @@ async def close_http():
         _http = None
 
 # ------------------------------------------------------------------------------
-# Helpers de cache
+# Cache helpers
 # ------------------------------------------------------------------------------
 
 
@@ -130,20 +127,20 @@ def _agg_put(payload: Dict[str, Any], kind: str, **params):
     _cache_put(_agg_cache, _agg_key(kind, **params), _with_ts(payload))
 
 # ------------------------------------------------------------------------------
-# Utilidades
+# Utils
 # ------------------------------------------------------------------------------
 
 
 async def _sleep_ms(ms: int):
     import asyncio
-    await asyncio.sleep(ms / 1000.0)
+    await asyncio.sleep(ms/1000.0)
 
 
 def parse_draw_date(s: str) -> Optional[dt.date]:
     if not s:
         return None
     s = s.strip()
-    m = re.match(r"(\d{1,2})/(\d{1,2})/(\d{2,4})", s)  # 17/10/2025
+    m = re.match(r"(\d{1,2})/(\d{1,2})/(\d{2,4})", s)
     if m:
         d, M, y = m.groups()
         d, M, y = int(d), int(M), int(y)
@@ -153,7 +150,7 @@ def parse_draw_date(s: str) -> Optional[dt.date]:
             return dt.date(y, M, d)
         except Exception:
             return None
-    m = re.match(r"(\d{4})-(\d{2})-(\d{2})", s)        # 2025-10-17
+    m = re.match(r"(\d{4})-(\d{2})-(\d{2})", s)
     if m:
         y, M, d = map(int, m.groups())
         try:
@@ -163,43 +160,8 @@ def parse_draw_date(s: str) -> Optional[dt.date]:
     return None
 
 
-def window_to_range(window: str) -> Tuple[Optional[dt.date], Optional[dt.date]]:
-    """
-    Aceita: 'Xm' (1–12) ou 'all'. (Alias opcional '1y' -> '12m'.)
-    """
-    today = dt.date.today()
-    if window == "1y":
-        window = "12m"
-
-    m = re.fullmatch(r"(\d{1,2})m", window)
-    if m:
-        months = int(m.group(1))
-        months = min(12, max(1, months))
-        year = today.year
-        month = today.month - months
-        while month <= 0:
-            month += 12
-            year -= 1
-        start = dt.date(year, month, min(today.day, 28))
-        return start, today
-
-    if window == "all":
-        return None, today
-
-    # fallback: 3m
-    return today - dt.timedelta(days=93), today
-
-
 def valid_15_unique(nums: List[int]) -> bool:
-    if len(nums) != 15:
-        return False
-    s = set(nums)
-    if len(s) != 15:
-        return False
-    for n in s:
-        if n < 1 or n > 25:
-            return False
-    return True
+    return len(nums) == 15 and len(set(nums)) == 15 and all(1 <= n <= 25 for n in nums)
 
 
 def histogram_even_odd(numbers: List[int]) -> Tuple[int, int]:
@@ -221,28 +183,21 @@ def summarize_draws(draws: List[dict]) -> Dict[str, Any]:
             hist["outros"] += 1
         evens.append(e)
         odds.append(o)
-    return {
-        "histogram": hist,
-        "avg_even": round(sum(evens)/total, 1),
-        "avg_odd": round(sum(odds)/total, 1),
-    }
+    return {"histogram": hist, "avg_even": round(sum(evens)/total, 1), "avg_odd": round(sum(odds)/total, 1)}
 
 
 def frequencies(draws: List[dict]) -> List[Dict[str, Any]]:
     counts = {n: 0 for n in range(1, 26)}
     total = max(1, len(draws))
     for d in draws:
-        nums = d.get("numbers") or []
-        if not valid_15_unique(nums):
-            continue
-        for x in nums:
+        for x in d.get("numbers", []):
             counts[x] += 1
     return [{"n": n, "count": counts[n], "pct": round((counts[n]/total)*100.0, 1)} for n in range(1, 26)]
 
 
 def build_parity_suggestion(draws: List[dict], even_needed: int = 8, odd_needed: int = 7) -> Dict[str, Any]:
     even_needed = max(0, min(15, even_needed))
-    odd_needed = max(0, min(15 - even_needed, odd_needed))
+    odd_needed = max(0, min(15-even_needed, odd_needed))
     if even_needed + odd_needed != 15:
         even_needed, odd_needed = 8, 7
     freq = frequencies(draws)
@@ -250,45 +205,77 @@ def build_parity_suggestion(draws: List[dict], even_needed: int = 8, odd_needed:
                 key=lambda x: (-x["count"], x["n"]))[:even_needed]
     od = sorted([f for f in freq if f["n"] % 2 == 1],
                 key=lambda x: (-x["count"], x["n"]))[:odd_needed]
-    chosen_even = [x["n"] for x in ev]
-    chosen_odd = [x["n"] for x in od]
-    combo = sorted(chosen_even + chosen_odd)
+    combo = sorted([x["n"] for x in ev] + [x["n"] for x in od])
     return {
-        "even": chosen_even, "odd": chosen_odd, "combo": combo,
+        "even": [x["n"] for x in ev],
+        "odd":  [x["n"] for x in od],
+        "combo": combo,
         "parity": {"even_count": even_needed, "odd_count": odd_needed},
         "pattern": f"{even_needed}-{odd_needed}",
     }
 
+
+def window_to_range(window: str) -> Tuple[Optional[dt.date], Optional[dt.date]]:
+    today = dt.date.today()
+    if window == "1y":
+        window = "12m"
+    m = re.fullmatch(r"(\d{1,2})m", window)
+    if m:
+        months = max(1, min(12, int(m.group(1))))
+        year = today.year
+        month = today.month - months
+        while month <= 0:
+            month += 12
+            year -= 1
+        start = dt.date(year, month, min(today.day, 28))
+        return start, today
+    if window == "all":
+        return None, today
+    return today - dt.timedelta(days=93), today
+
 # ------------------------------------------------------------------------------
-# CAIXA API + Fallback Mirror
+# Normalizadores e coletores (Mirror / JSON / HTML)
 # ------------------------------------------------------------------------------
 
 
-def _normalize_json(j: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def _normalize_from_any(j: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """
-    Normaliza UM concurso e valida: 15 dezenas únicas ∈ [1..25]
+    Aceita tanto o JSON oficial da CAIXA quanto o do mirror.
     """
     try:
-        numero = int(j.get("numero"))
-        dezenas = j.get("listaDezenas") or j.get("dezenas") or []
+        # CAIXA: numero / listaDezenas
+        numero = j.get("numero")
+        dezenas = j.get("listaDezenas")
+        data = j.get("dataApuracao") or j.get("data")
+        if numero is None:
+            # Mirror: concurso / dezenas
+            numero = j.get("concurso")
+            dezenas = dezenas or j.get("dezenas")
+        if numero is None or dezenas is None:
+            return None
+        n_concurso = int(str(numero))
         nums = [int(str(x)) for x in dezenas]
         if not valid_15_unique(nums):
             return None
-        date = str(j.get("dataApuracao") or j.get("data") or "")
         e, o = histogram_even_odd(nums)
-        return {"contest": numero, "date": date, "numbers": nums,
-                "even_count": e, "odd_count": o, "source": "caixa"}
+        return {
+            "contest": n_concurso,
+            "date": str(data or ""),
+            "numbers": nums,
+            "even_count": e, "odd_count": o,
+            "source": "caixa",
+        }
     except Exception:
         return None
 
 
-async def _mirror_get_latest() -> dict | None:
+async def _mirror_get_latest() -> Optional[Dict[str, Any]]:
     try:
-        client = await ensure_http()
-        r = await client.get(MIRROR_LATEST, timeout=HTTP_TIMEOUT)
+        c = await ensure_http()
+        r = await c.get(MIRROR_LATEST)
         r.raise_for_status()
         j = r.json()
-        data = _normalize_json(j)
+        data = _normalize_from_any(j)
         if data:
             data["source"] = "mirror"
             return data
@@ -297,17 +284,17 @@ async def _mirror_get_latest() -> dict | None:
     return None
 
 
-async def _mirror_get_concurso(n: int) -> dict | None:
+async def _mirror_get_concurso(n: int) -> Optional[Dict[str, Any]]:
     try:
-        client = await ensure_http()
-        r = await client.get(MIRROR_BY_ID.format(n=n), timeout=HTTP_TIMEOUT)
+        c = await ensure_http()
+        r = await c.get(MIRROR_BY_ID.format(n=n))
         if r.status_code == 404:
             return None
         r.raise_for_status()
         j = r.json()
-        if int(j.get("numero", 0)) != int(n):
+        if int(str(j.get("numero") or j.get("concurso") or 0)) != n:
             return None
-        data = _normalize_json(j)
+        data = _normalize_from_any(j)
         if data:
             data["source"] = "mirror"
             return data
@@ -316,122 +303,196 @@ async def _mirror_get_concurso(n: int) -> dict | None:
     return None
 
 
-async def _caixa_get_latest() -> Dict[str, Any]:
-    """
-    Busca o último concurso. Respeita PREFER_MIRROR.
-    """
-    cache_key = "latest"
-    cached = _cache_get(_caixa_cache, cache_key, CAIXA_TTL_SEC)
+async def _json_get_latest() -> Optional[Dict[str, Any]]:
+    c = await ensure_http()
+    for base in CAIXA_HOSTS:
+        try:
+            r = await c.get(base, params={"_": int(time.time()*1000)})
+            r.raise_for_status()
+            j = r.json()
+            data = _normalize_from_any(j)
+            if data:
+                return data
+        except Exception:
+            continue
+    return None
+
+
+async def _json_get_concurso(n: int) -> Optional[Dict[str, Any]]:
+    c = await ensure_http()
+    ts = int(time.time()*1000)
+    variants = []
+    for base in CAIXA_HOSTS:
+        variants.append((base, {"concurso": n, "_": ts}))
+        variants.append((f"{base}/{n}", {"_": ts}))
+    for url, params in variants:
+        try:
+            r = await c.get(url, params=params)
+            if r.status_code == 404:
+                continue
+            r.raise_for_status()
+            j = r.json()
+            if int(str(j.get("numero") or 0)) != n:
+                continue
+            data = _normalize_from_any(j)
+            if data:
+                return data
+        except Exception:
+            continue
+    return None
+
+# ---------------- HTML SCRAPER ----------------
+_HTML_RE_CONCURSO = re.compile(
+    r"Concurso\s+(\d+)\s*\((\d{2}/\d{2}/\d{4})\)", re.I)
+# captura 0..29; filtraremos 1..25
+_HTML_RE_NUM = re.compile(r"\b([0-2]?\d)\b")
+
+
+def _pick_15_numbers_near(html: str, anchor: int) -> Optional[List[int]]:
+    # Pega uma janela perto do título e extrai os primeiros 15 números 1..25
+    segment = html[anchor: anchor+4000]
+    raw = [int(x) for x in _HTML_RE_NUM.findall(segment)]
+    nums: List[int] = []
+    for v in raw:
+        if 1 <= v <= 25:
+            nums.append(v)
+            if len(nums) == 15:
+                break
+    return nums if valid_15_unique(nums) else None
+
+
+async def _html_get_latest() -> Optional[Dict[str, Any]]:
+    c = await ensure_http()
+    for url in CAIXA_HTML_URLS[:1]:  # primeira URL = "último"
+        try:
+            r = await c.get(url)
+            r.raise_for_status()
+            h = r.text
+            m = _HTML_RE_CONCURSO.search(h)
+            if not m:
+                continue
+            concurso = int(m.group(1))
+            data = m.group(2)
+            nums = _pick_15_numbers_near(h, m.start())
+            if not nums:
+                continue
+            e, o = histogram_even_odd(nums)
+            return {"contest": concurso, "date": data, "numbers": nums,
+                    "even_count": e, "odd_count": o, "source": "html"}
+        except Exception:
+            continue
+    return None
+
+
+async def _html_get_concurso(n: int) -> Optional[Dict[str, Any]]:
+    c = await ensure_http()
+    for tpl in CAIXA_HTML_URLS:
+        try:
+            url = tpl.format(n=n) if "{n}" in tpl else tpl
+            r = await c.get(url)
+            r.raise_for_status()
+            h = r.text
+            m = _HTML_RE_CONCURSO.search(h)
+            if not m:
+                continue
+            concurso = int(m.group(1))
+            data = m.group(2)
+            if concurso != n:
+                continue
+            nums = _pick_15_numbers_near(h, m.start())
+            if not nums:
+                continue
+            e, o = histogram_even_odd(nums)
+            return {"contest": concurso, "date": data, "numbers": nums,
+                    "even_count": e, "odd_count": o, "source": "html"}
+        except Exception:
+            continue
+    return None
+
+# ---------------- Resolver com 3 níveis ----------------
+
+
+async def _get_latest() -> Dict[str, Any]:
+    key = "latest"
+    cached = _cache_get(_caixa_cache, key, CAIXA_TTL_SEC)
     if cached:
         return cached
-    client = await ensure_http()
 
-    # 1) tenta mirror primeiro se preferido
     if PREFER_MIRROR:
         m = await _mirror_get_latest()
         if m:
-            _cache_put(_caixa_cache, cache_key, m)
+            _cache_put(_caixa_cache, key, m)
             return m
 
-    # 2) tenta CAIXA (dois hosts)
-    for base in CAIXA_HOSTS:
-        try:
-            r = await client.get(base, params={"_": int(time.time()*1000)}, follow_redirects=True)
-            r.raise_for_status()
-            j = r.json()
-            data = _normalize_json(j)
-            if data:
-                _cache_put(_caixa_cache, cache_key, data)
-                return data
-        except httpx.HTTPError:
-            continue
+    j = await _json_get_latest()
+    if j:
+        _cache_put(_caixa_cache, key, j)
+        return j
 
-    # 3) mirror (se ainda não tentou / se falhou)
     m = await _mirror_get_latest()
     if m:
-        _cache_put(_caixa_cache, cache_key, m)
+        _cache_put(_caixa_cache, key, m)
         return m
 
-    return {"contest": 0, "date": "", "numbers": [], "source": "caixa"}
+    h = await _html_get_latest()
+    if h:
+        _cache_put(_caixa_cache, key, h)
+        return h
+
+    return {"contest": 0, "date": "", "numbers": [], "source": "none"}
 
 
-async def _caixa_get_concurso(n: int) -> Optional[Dict[str, Any]]:
-    """
-    Busca um concurso específico N. Respeita PREFER_MIRROR.
-    """
-    cache_key = f"c:{n}"
-    cached = _cache_get(_caixa_cache, cache_key, CAIXA_TTL_SEC)
+async def _get_concurso(n: int) -> Optional[Dict[str, Any]]:
+    key = f"c:{n}"
+    cached = _cache_get(_caixa_cache, key, CAIXA_TTL_SEC)
     if cached:
         return cached
 
-    client = await ensure_http()
-    ts = int(time.time() * 1000)
-
-    # 1) tenta mirror primeiro, se preferido
     if PREFER_MIRROR:
         m = await _mirror_get_concurso(n)
         if m:
-            _cache_put(_caixa_cache, cache_key, m)
+            _cache_put(_caixa_cache, key, m)
             return m
 
-    # 2) tenta CAIXA (variações)
-    variants = []
-    for base in CAIXA_HOSTS:
-        variants.append(
-            {"url": base,          "params": {"concurso": n, "_": ts}})
-        variants.append({"url": f"{base}/{n}", "params": {"_": ts}})
+    j = await _json_get_concurso(n)
+    if j:
+        _cache_put(_caixa_cache, key, j)
+        return j
 
-    for item in variants:
-        try:
-            r = await client.get(item["url"], params=item["params"], follow_redirects=True)
-            if r.status_code == 404:
-                await _sleep_ms(60)
-                continue
-            r.raise_for_status()
-            j = r.json()
-            if int(j.get("numero", 0)) != int(n):
-                await _sleep_ms(60)
-                continue
-            data = _normalize_json(j)
-            if not data:
-                await _sleep_ms(60)
-                continue
-            _cache_put(_caixa_cache, cache_key, data)
-            return data
-        except httpx.HTTPError:
-            await _sleep_ms(80)
-            continue
-
-    # 3) mirror como último recurso
     m = await _mirror_get_concurso(n)
     if m:
-        _cache_put(_caixa_cache, cache_key, m)
+        _cache_put(_caixa_cache, key, m)
         return m
+
+    h = await _html_get_concurso(n)
+    if h:
+        _cache_put(_caixa_cache, key, h)
+        return h
 
     return None
 
 # ------------------------------------------------------------------------------
-# Coleta (últimos N) e por janela
+# Coleta em lote
 # ------------------------------------------------------------------------------
 
 
-async def collect_last_n(limit: int) -> list[dict]:
-    latest = await _caixa_get_latest()
+async def collect_last_n(limit: int) -> List[dict]:
+    latest = await _get_latest()
     last_n = int(latest.get("contest") or 0)
     if last_n <= 0:
         return []
-    results: List[dict] = []
+    out: List[dict] = []
     n = last_n
-    while n >= 1 and len(results) < limit:
-        got = await _caixa_get_concurso(n)
-        if got:
-            results.append(got)
+    while n >= 1 and len(out) < limit:
+        d = await _get_concurso(n)
+        if d:
+            out.append(d)
         n -= 1
-    return results[:limit]
+    return out[:limit]
 
 
-async def collect_by_date(start: Optional[dt.date], end: Optional[dt.date], max_fetch: int = 400) -> list[dict]:
-    latest = await _caixa_get_latest()
+async def collect_by_date(start: Optional[dt.date], end: Optional[dt.date], max_fetch: int = 400) -> List[dict]:
+    latest = await _get_latest()
     last_n = int(latest.get("contest") or 0)
     if last_n <= 0:
         return []
@@ -439,7 +500,7 @@ async def collect_by_date(start: Optional[dt.date], end: Optional[dt.date], max_
     fetched = 0
     n = last_n
     while n >= 1 and fetched < max_fetch:
-        d = await _caixa_get_concurso(n)
+        d = await _get_concurso(n)
         fetched += 1
         n -= 1
         if not d:
@@ -485,9 +546,9 @@ async def health():
 @app.get("/ready", response_class=JSONResponse)
 async def ready():
     try:
-        latest = await _caixa_get_latest()
+        latest = await _get_latest()
         ok = bool(latest and latest.get("contest"))
-        return {"status": "ok" if ok else "warn", "http": True, "latest_contest": latest.get("contest")}
+        return {"status": "ok" if ok else "warn", "http": True, "latest_contest": latest.get("contest", 0)}
     except Exception as e:
         return {"status": "fail", "http": False, "error": str(e)}
 
@@ -497,9 +558,8 @@ async def lotofacil(limit: int = Query(10, ge=1, le=200), force: bool = False):
     cache = None if force else _agg_get("lotofacil", limit=limit)
     if cache:
         data = cache.copy()
-        ts = data.get("_ts")
+        ts = data.pop("_ts", None)
         data["cache_age_seconds"] = int(time.time() - ts) if ts else None
-        data.pop("_ts", None)
         return data
 
     draws = await collect_last_n(limit)
@@ -509,8 +569,8 @@ async def lotofacil(limit: int = Query(10, ge=1, le=200), force: bool = False):
         "limit": limit,
         "summary": summarize_draws(draws),
         "results": draws,
-        "method": "caixa",
-        "source_url": CAIXA_HOSTS[0],
+        "method": "mixed",
+        "source_url": "caixa|mirror|html",
         "cache_age_seconds": None,
     }
     _agg_put(payload, "lotofacil", limit=limit)
@@ -519,29 +579,22 @@ async def lotofacil(limit: int = Query(10, ge=1, le=200), force: bool = False):
 
 
 @app.get("/stats", response_class=JSONResponse)
-async def stats(
-    limit: int = Query(60, ge=1, le=200),
-    hi: int = Query(12, ge=0, le=15),
-    lo: int = Query(3, ge=0, le=15),
-    force: bool = False,
-):
+async def stats(limit: int = Query(60, ge=1, le=200), hi: int = Query(12, ge=0, le=15), lo: int = Query(3, ge=0, le=15), force: bool = False):
     hi = max(0, min(15, hi))
-    lo = max(0, min(15 - hi, lo))
+    lo = max(0, min(15-hi, lo))
     if hi + lo != 15:
         hi, lo = 12, 3
 
     cache = None if force else _agg_get("stats", limit=limit, hi=hi, lo=lo)
     if cache:
         data = cache.copy()
-        ts = data.get("_ts")
+        ts = data.pop("_ts", None)
         data["cache_age_seconds"] = int(time.time() - ts) if ts else None
-        data.pop("_ts", None)
         return data
 
     draws = await collect_last_n(limit)
     freqs = frequencies(draws)
-    sugg = build_parity_suggestion(draws, even_needed=8, odd_needed=7)
-
+    sugg = build_parity_suggestion(draws, 8, 7)
     payload = {
         "ok": True,
         "considered_games": len(draws),
@@ -560,9 +613,9 @@ async def stats(
             "pattern": "n/a",
         },
         "parity_pattern_example": sugg["pattern"],
-        "method": "caixa",
+        "method": "mixed",
         "updated_at": dt.datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
-        "source_url": CAIXA_HOSTS[0],
+        "source_url": "caixa|mirror|html",
         "cache_age_seconds": None,
     }
     _agg_put(payload, "stats", limit=limit, hi=hi, lo=lo)
@@ -583,9 +636,8 @@ async def parity(
         "parity", window=window, start=start, end=end, even=even, odd=odd)
     if cache:
         data = cache.copy()
-        ts = data.get("_ts")
+        ts = data.pop("_ts", None)
         data["cache_age_seconds"] = int(time.time() - ts) if ts else None
-        data.pop("_ts", None)
         return data
 
     if start or end:
@@ -608,9 +660,9 @@ async def parity(
         "frequencies": freqs,
         "suggestion": sugg,
         "pattern": sugg["pattern"],
-        "method": "caixa",
+        "method": "mixed",
         "updated_at": dt.datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
-        "source_url": CAIXA_HOSTS[0],
+        "source_url": "caixa|mirror|html",
         "cache_age_seconds": None,
     }
     _agg_put(payload, "parity", window=window,
@@ -619,39 +671,38 @@ async def parity(
     return payload
 
 # ------------------------------------------------------------------------------
-# UI simples (/app)
+# UI simples
 # ------------------------------------------------------------------------------
 
 
 @app.get("/app", response_class=HTMLResponse)
 async def ui():
-    return HTMLResponse(
-        """
+    return HTMLResponse(f"""
 <!doctype html>
 <html lang="pt-br">
 <head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Lotofácil – 8 pares / 7 ímpares</title>
-  <style>
-    :root { color-scheme: dark; }
-    body { background:#0f172a; color:#e2e8f0; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto; }
-    .wrap { max-width: 1024px; margin: 24px auto; padding: 0 16px; }
-    .card { background:#0b1220; border:1px solid #1e293b; border-radius:12px; padding:16px; margin:16px 0; }
-    .title { font-weight:700; font-size:18px; margin-bottom:8px; }
-    .row { display:flex; gap:12px; align-items:center; flex-wrap:wrap; }
-    input, select, button { background:#0b1220; color:#e2e8f0; border:1px solid #1e293b; border-radius:10px; padding:10px 12px; }
-    button { cursor:pointer; }
-    .pill { border-radius:999px; padding:10px 14px; border:1px solid #1e293b; }
-    .ball { width:60px; height:60px; border-radius:999px; display:flex; align-items:center; justify-content:center; font-weight:700; font-size:18px; margin:8px; }
-    .ball.g { background:#16a34a22; border:1px solid #16a34a; color:#d1fae5; }
-    .ball.r { background:#ef444422; border:1px solid #ef4444; color:#fee2e2; }
-    table { width:100%; border-collapse: collapse; }
-    th, td { padding:10px; border-top: 1px solid #1e293b; text-align:left; }
-    canvas { width:100%; height:260px; }
-    .muted { color:#94a3b8; font-size:12px; }
-  </style>
-  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Lotofácil – 8 pares / 7 ímpares</title>
+<style>
+:root {{ color-scheme: dark; }}
+body {{ background:#0f172a; color:#e2e8f0; font-family: ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto; }}
+.wrap {{ max-width:1024px; margin:24px auto; padding:0 16px; }}
+.card {{ background:#0b1220; border:1px solid #1e293b; border-radius:12px; padding:16px; margin:16px 0; }}
+.title {{ font-weight:700; font-size:18px; margin-bottom:8px; }}
+.row {{ display:flex; gap:12px; align-items:center; flex-wrap:wrap; }}
+input,select,button {{ background:#0b1220; color:#e2e8f0; border:1px solid #1e293b; border-radius:10px; padding:10px 12px; }}
+button {{ cursor:pointer; }}
+.pill {{ border-radius:999px; padding:10px 14px; border:1px solid #1e293b; }}
+.ball {{ width:60px; height:60px; border-radius:999px; display:flex; align-items:center; justify-content:center; font-weight:700; font-size:18px; margin:8px; }}
+.ball.g {{ background:#16a34a22; border:1px solid #16a34a; color:#d1fae5; }}
+.ball.r {{ background:#ef444422; border:1px solid #ef4444; color:#fee2e2; }}
+table {{ width:100%; border-collapse:collapse; }}
+th,td {{ padding:10px; border-top:1px solid #1e293b; text-align:left; }}
+canvas {{ width:100%; height:260px; }}
+.muted {{ color:#94a3b8; font-size:12px; }}
+</style>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 </head>
 <body>
 <div class="wrap">
@@ -662,30 +713,16 @@ async def ui():
       <div>Janela</div>
       <select id="selWindow"></select>
       <script>
-        (function fillWindowOptions(){
-          const sel = document.getElementById('selWindow');
-          for (let m = 1; m <= 12; m++) {
-            const opt = document.createElement('option');
-            opt.value = `${m}m`;
-            opt.textContent = m === 1 ? '1 mês' : `${m} meses`;
-            if (m === 3) opt.selected = true;
-            sel.appendChild(opt);
-          }
-          const all = document.createElement('option');
-          all.value = 'all';
-          all.textContent = 'Tudo';
-          sel.appendChild(all);
-        })();
+      (function(){{ const sel = document.getElementById('selWindow');
+        for(let m=1;m<=12;m++){{const o=document.createElement('option');o.value=`${{m}}m`;o.textContent=m===1?'1 mês':`${{m}} meses`;if(m===3)o.selected=true;sel.appendChild(o);}}
+        const all=document.createElement('option');all.value='all';all.textContent='Tudo';sel.appendChild(all);
+      }})();
       </script>
-
       <div>Custom:</div>
       <input id="inpStart" type="date" />
       <input id="inpEnd" type="date" />
-
-      <div>Pares</div>
-      <input id="inpEven" type="number" value="8" min="0" max="15" />
-      <div>Ímpares</div>
-      <input id="inpOdd" type="number" value="7" min="0" max="15" />
+      <div>Pares</div><input id="inpEven" type="number" value="8" min="0" max="15" />
+      <div>Ímpares</div><input id="inpOdd" type="number" value="7" min="0" max="15" />
       <label class="row"><input id="chkForce" type="checkbox" />&nbsp;Forçar atualização</label>
       <button onclick="loadAll()">Atualizar</button>
     </div>
@@ -699,94 +736,59 @@ async def ui():
     <div id="suggBalls" class="row"></div>
   </div>
 
-  <div class="card">
-    <div class="title">Frequência por dezena (na janela)</div>
-    <canvas id="chartFreq"></canvas>
-  </div>
+  <div class="card"><div class="title">Frequência por dezena (na janela)</div><canvas id="chartFreq"></canvas></div>
 
   <div class="card">
     <div class="title">Amostra (10 últimos)</div>
-    <table id="tbl">
-      <thead><tr><th>Concurso</th><th>Data</th><th>Dezenas</th><th>Padrão</th></tr></thead>
-      <tbody></tbody>
-    </table>
+    <table id="tbl"><thead><tr><th>Concurso</th><th>Data</th><th>Dezenas</th><th>Padrão</th></tr></thead><tbody></tbody></table>
   </div>
 
-  <div class="muted">Fonte: CAIXA · API pessoal · v""" + APP_VERSION + """</div>
+  <div class="muted">Fonte: CAIXA · API pessoal · v{APP_VERSION}</div>
 </div>
 
 <script>
-async function fetchJSON(url) {
-  const res = await fetch(url);
-  if (!res.ok) throw new Error("HTTP " + res.status);
-  return await res.json();
-}
-function ball(n) {
-  const cls = (n % 2 === 0) ? 'g' : 'r';
-  return `<div class="ball ${cls}">${String(n).padStart(2,'0')}</div>`;
-}
-let freqChart = null;
+async function j(url){{const r=await fetch(url);if(!r.ok)throw new Error('HTTP '+r.status);return r.json();}}
+function ball(n){{const c=(n%2===0)?'g':'r';return `<div class="ball ${c}">${String(n).padStart(2,'0')}</div>`;}}
+let freqChart=null;
 
-async function loadAll() {
-  const w = document.getElementById('selWindow').value;
-  const start = document.getElementById('inpStart').value;
-  const end = document.getElementById('inpEnd').value;
-  const E = document.getElementById('inpEven').value || 8;
-  const O = document.getElementById('inpOdd').value || 7;
-  const force = document.getElementById('chkForce').checked ? '&force=true' : '';
+async function loadAll(){{
+  const w=document.getElementById('selWindow').value;
+  const start=document.getElementById('inpStart').value;
+  const end=document.getElementById('inpEnd').value;
+  const E=document.getElementById('inpEven').value||8;
+  const O=document.getElementById('inpOdd').value||7;
+  const force=document.getElementById('chkForce').checked?'&force=true':'';
+  let url=`/parity?window=${{w}}&even=${{E}}&odd=${{O}}${{force}}`;
+  if(start||end) url=`/parity?even=${{E}}&odd=${{O}}${{start?`&start=${{start}}`:''}}${{end?`&end=${{end}}`:''}}${{force}}`;
 
-  let url = `/parity?window=${w}&even=${E}&odd=${O}${force}`;
-  if (start || end) {
-    const s = start ? `&start=${start}` : '';
-    const e = end ? `&end=${end}` : '';
-    url = `/parity?even=${E}&odd=${O}${s}${e}${force}`;
-  }
-
-  // pega paridade e /ready em paralelo
-  const [p, rdy] = await Promise.all([ fetchJSON(url), fetchJSON('/ready') ]);
-  const latestContest = rdy?.latest_contest ?? '—';
-
+  const [p,rdy] = await Promise.all([ j(url), j('/ready') ]);
+  const latest = rdy?.latest_contest ?? '—';
   document.getElementById('meta').innerText =
-    `método: ${p.method} · Atualizado: ${p.updated_at} · jogos considerados: ${p.considered_games} · ` +
-    `janela: ${p.start || '—'} → ${p.end || '—'} · concurso mais atual: ${latestContest}`;
+    `método: ${{p.method}} · Atualizado: ${{p.updated_at}} · jogos considerados: ${{p.considered_games}} · `+
+    `janela: ${{p.start||'—'}} → ${{p.end||'—'}} · concurso mais atual: ${{latest}}`;
 
-  // sugerida
-  const s = p.suggestion;
-  document.getElementById('pillParidade').innerText = s.pattern + ' (pares/ímpares)';
-  let html = '';
-  for (const n of s.combo) html += ball(n);
-  document.getElementById('suggBalls').innerHTML = html;
+  const s=p.suggestion; document.getElementById('pillParidade').innerText = s.pattern+' (pares/ímpares)';
+  document.getElementById('suggBalls').innerHTML = s.combo.map(ball).join('');
 
-  // gráfico
-  const labels = p.frequencies.map(x => String(x.n).padStart(2,'0'));
-  const data = p.frequencies.map(x => x.count);
-  if (freqChart) freqChart.destroy();
-  const ctx = document.getElementById('chartFreq');
-  freqChart = new Chart(ctx, {
-    type: 'bar',
-    data: { labels, datasets: [{ label: 'Frequência', data }] },
-    options: { responsive:true, plugins:{legend:{display:false}} }
-  });
+  const labels=p.frequencies.map(x=>String(x.n).padStart(2,'0'));
+  const data=p.frequencies.map(x=>x.count);
+  if(freqChart) freqChart.destroy();
+  freqChart=new Chart(document.getElementById('chartFreq'), {{
+    type:'bar', data:{{labels,datasets:[{{label:'Frequência',data}}]}}, options:{{responsive:true,plugins:{{legend:{{display:false}}}}}}
+  }});
 
-  // amostra 10 últimos
-  const lotos = await fetchJSON('/lotofacil?limit=10');
-  const tb = document.querySelector('#tbl tbody');
-  tb.innerHTML = '';
-  for (const r of lotos.results) {
-    const padrao = `${r.even_count}-${r.odd_count}`;
-    const nums = r.numbers.map(n => String(n).padStart(2,'0')).join(' ');
-    const tr = `<tr><td>${r.contest}</td><td>${r.date||''}</td><td>${nums}</td><td>${padrao}</td></tr>`;
-    tb.insertAdjacentHTML('beforeend', tr);
-  }
-}
+  const lotos=await j('/lotofacil?limit=10'); const tb=document.querySelector('#tbl tbody'); tb.innerHTML='';
+  for(const r of lotos.results){{
+    const pad=`${{r.even_count}}-${{r.odd_count}}`;
+    const nums=r.numbers.map(n=>String(n).padStart(2,'0')).join(' ');
+    tb.insertAdjacentHTML('beforeend', `<tr><td>${{r.contest}}</td><td>${{r.date||''}}</td><td>${{nums}}</td><td>${{pad}}</td></tr>`);
+  }}
+}}
 loadAll();
 </script>
-</body>
-</html>
-        """
-    )
+</body></html>
+""")
 
 
 @app.on_event("shutdown")
-async def _shutdown():
-    await close_http()
+async def _shutdown(): await close_http()
