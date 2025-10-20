@@ -675,7 +675,6 @@ async def parity(
 # ------------------------------------------------------------------------------
 
 
-
 @app.get("/app", response_class=HTMLResponse)
 async def ui():
     html = """<!doctype html>
@@ -702,6 +701,86 @@ table { width:100%; border-collapse:collapse; }
 th,td { padding:10px; border-top:1px solid #1e293b; text-align:left; }
 canvas { width:100%; height:260px; }
 .muted { color:#94a3b8; font-size:12px; }
+let freqChart = null;
+
+async function loadAll(manual=false){
+  setLoading(true);
+  try{
+    const w    = document.getElementById('selWindow').value;
+    const start= document.getElementById('inpStart').value;
+    const end  = document.getElementById('inpEnd').value;
+    const E    = document.getElementById('inpEven').value || 8;
+    const O    = document.getElementById('inpOdd').value  || 7;
+
+    const force = manual ? '&force=true' : '';
+    let url = `/parity?window=${w}&even=${E}&odd=${O}${force}`;
+    if(start || end){
+      url = `/parity?even=${E}&odd=${O}${start?`&start=${start}`:''}${end?`&end=${end}`:''}${force}`;
+    }
+
+    const [p, rdy] = await Promise.all([
+      fetch(url).then(r=>r.json()),
+      fetch('/ready').then(r=>r.json())
+    ]);
+
+    // badges
+    const updated = formatBrDateTime(p.updated_at || '');
+    document.getElementById('bdupdated').innerText =
+      `${updated} · ${agoBR(p.updated_at || '')}`;
+    document.getElementById('bdwindow').innerText =
+      `${p.start?.split('-').reverse().join('-') || '—'} → ${p.end?.split('-').reverse().join('-') || '—'}`;
+    document.getElementById('bdgames').innerText  = p.considered_games ?? '0';
+    document.getElementById('bdlatest').innerText = rdy?.latest_contest ?? '—';
+
+    // sugestão
+    const s = p.suggestion;
+    document.getElementById('pillParidade').innerText = s.pattern+' (pares/ímpares)';
+    document.getElementById('suggBalls').innerHTML   = s.combo
+      .map(n => `<div class="ball ${(n%2===0)?'g':'r'}">${String(n).padStart(2,'0')}</div>`)
+      .join('');
+
+    // gráfico
+    const labels = p.frequencies.map(x => String(x.n).padStart(2,'0'));
+    const data   = p.frequencies.map(x => x.count);
+    if(freqChart) freqChart.destroy();
+    freqChart = new Chart(document.getElementById('chartFreq'), {
+      type:'bar',
+      data:{ labels, datasets:[{ label:'Frequência', data }] },
+      options:{ responsive:true, plugins:{ legend:{ display:false } } }
+    });
+
+    // tabela
+    const lotos = await fetch('/lotofacil?limit=10').then(r=>r.json());
+    const tb = document.querySelector('#tbl tbody'); tb.innerHTML='';
+    for(const r of lotos.results || []){
+      const pad = `${r.even_count}-${r.odd_count}`;
+      const nums= r.numbers.map(n=>String(n).padStart(2,'0')).join(' ');
+      tb.insertAdjacentHTML('beforeend',
+        `<tr><td>${r.contest}</td><td>${r.date||''}</td><td>${nums}</td><td>${pad}</td></tr>`);
+    }
+  }catch(e){
+    console.error(e);
+    alert('Falha ao atualizar. Tente novamente.');
+  }finally{
+    setLoading(false);
+  }
+}
+
+// popula seletor de janela e faz a 1ª carga (sem force)
+(function(){
+  const sel = document.getElementById('selWindow');
+  for(let m=1; m<=12; m++){
+    const o = document.createElement('option');
+    o.value = `${m}m`;
+    o.textContent = m===1 ? '1 mês' : `${m} meses`;
+    if(m===3) o.selected = true;
+    sel.appendChild(o);
+  }
+  const all = document.createElement('option'); all.value='all'; all.textContent='Tudo';
+  sel.appendChild(all);
+  // primeira carga
+  loadAll(false);
+})();
 </style>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 </head>
@@ -834,7 +913,6 @@ loadAll();
 </script>
 </body></html>"""
     return HTMLResponse(html.replace("{{APP_VERSION}}", APP_VERSION))
-
 
 
 @app.on_event("shutdown")
