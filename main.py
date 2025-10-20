@@ -1,9 +1,8 @@
-# Lotofacil API – v6.3.0
-# - Fonte primária: CAIXA (HTTP JSON)
-# - Fallback: mirror público (somente leitura) quando a CAIXA bloquear do datacenter
-# - Janela 1..12m, ou "all", ou datas customizadas (start/end)
-# - /app com meta incluindo "concurso mais atual"
-# - Sem Playwright/Chromium (leve e compatível com Render Free)
+# Lotofacil API – v6.3.1
+# - Fonte primária: CAIXA (HTTP JSON). Fallback: mirror público (somente leitura).
+# - Flag PREFER_MIRROR=1 faz tentar o mirror primeiro (bom para Render Free).
+# - Janela 1..12m, "all" ou datas customizadas (start/end).
+# - /app mostra "concurso mais atual" e a combinação 8-7 (pares/ímpares) por padrão.
 
 from __future__ import annotations
 
@@ -22,7 +21,7 @@ from fastapi.middleware.cors import CORSMiddleware
 # ------------------------------------------------------------------------------
 # Config
 # ------------------------------------------------------------------------------
-APP_VERSION = "6.3.0"
+APP_VERSION = "6.3.1"
 
 CAIXA_HOSTS = [
     "https://servicebus2.caixa.gov.br/portaldeloterias/api/lotofacil",
@@ -34,18 +33,20 @@ MIRROR_LATEST = "https://loteriascaixa-api.herokuapp.com/api/lotofacil/latest"
 MIRROR_BY_ID = "https://loteriascaixa-api.herokuapp.com/api/lotofacil/{n}"
 
 HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "12"))     # segs
-# não usado no serial, mantido p/ compat
+# não usado no serial; legado
 BATCH_SIZE = int(os.getenv("BATCH_SIZE", "20"))
-AGG_TTL_SEC = int(os.getenv("AGG_TTL_SEC", "120"))      # cache dos agregados
-# cache de chamadas à CAIXA/mirror
+AGG_TTL_SEC = int(os.getenv("AGG_TTL_SEC", "120"))     # cache dos agregados
+# cache de chamadas CAIXA/mirror
 CAIXA_TTL_SEC = int(os.getenv("CAIXA_TTL_SEC", "120"))
+# tentar mirror primeiro?
+PREFER_MIRROR = os.getenv("PREFER_MIRROR", "0") == "1"
 
 # ------------------------------------------------------------------------------
 # Estado global
 # ------------------------------------------------------------------------------
 _http: httpx.AsyncClient | None = None
 _caixa_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}  # key->(ts,json)
-_agg_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}    # key->(ts,payload)
+_agg_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}  # key->(ts,payload)
 
 # ------------------------------------------------------------------------------
 # App
@@ -63,7 +64,7 @@ app.add_middleware(
 
 
 async def ensure_http() -> httpx.AsyncClient:
-    """Client httpx com headers bem próximos do site oficial."""
+    """Client httpx com headers próximos do site oficial."""
     global _http
     if _http is None:
         _http = httpx.AsyncClient(
@@ -316,39 +317,48 @@ async def _mirror_get_concurso(n: int) -> dict | None:
 
 
 async def _caixa_get_latest() -> Dict[str, Any]:
+    """
+    Busca o último concurso. Respeita PREFER_MIRROR.
+    """
     cache_key = "latest"
     cached = _cache_get(_caixa_cache, cache_key, CAIXA_TTL_SEC)
     if cached:
         return cached
     client = await ensure_http()
-    # tenta CAIXA (dois hosts)
+
+    # 1) tenta mirror primeiro se preferido
+    if PREFER_MIRROR:
+        m = await _mirror_get_latest()
+        if m:
+            _cache_put(_caixa_cache, cache_key, m)
+            return m
+
+    # 2) tenta CAIXA (dois hosts)
     for base in CAIXA_HOSTS:
         try:
             r = await client.get(base, params={"_": int(time.time()*1000)}, follow_redirects=True)
             r.raise_for_status()
             j = r.json()
             data = _normalize_json(j)
-            if not data:
-                # resposta inválida → tenta mirror
-                m = await _mirror_get_latest()
-                if m:
-                    _cache_put(_caixa_cache, cache_key, m)
-                    return m
-                data = {"contest": int(j.get("numero", 0)), "date": j.get(
-                    "dataApuracao") or "", "numbers": [], "source": "caixa"}
-            _cache_put(_caixa_cache, cache_key, data)
-            return data
+            if data:
+                _cache_put(_caixa_cache, cache_key, data)
+                return data
         except httpx.HTTPError:
             continue
-    # CAIXA falhou → mirror
+
+    # 3) mirror (se ainda não tentou / se falhou)
     m = await _mirror_get_latest()
     if m:
         _cache_put(_caixa_cache, cache_key, m)
         return m
+
     return {"contest": 0, "date": "", "numbers": [], "source": "caixa"}
 
 
 async def _caixa_get_concurso(n: int) -> Optional[Dict[str, Any]]:
+    """
+    Busca um concurso específico N. Respeita PREFER_MIRROR.
+    """
     cache_key = f"c:{n}"
     cached = _cache_get(_caixa_cache, cache_key, CAIXA_TTL_SEC)
     if cached:
@@ -356,10 +366,19 @@ async def _caixa_get_concurso(n: int) -> Optional[Dict[str, Any]]:
 
     client = await ensure_http()
     ts = int(time.time() * 1000)
+
+    # 1) tenta mirror primeiro, se preferido
+    if PREFER_MIRROR:
+        m = await _mirror_get_concurso(n)
+        if m:
+            _cache_put(_caixa_cache, cache_key, m)
+            return m
+
+    # 2) tenta CAIXA (variações)
     variants = []
     for base in CAIXA_HOSTS:
         variants.append(
-            {"url": base,         "params": {"concurso": n, "_": ts}})
+            {"url": base,          "params": {"concurso": n, "_": ts}})
         variants.append({"url": f"{base}/{n}", "params": {"_": ts}})
 
     for item in variants:
@@ -383,11 +402,12 @@ async def _caixa_get_concurso(n: int) -> Optional[Dict[str, Any]]:
             await _sleep_ms(80)
             continue
 
-    # CAIXA falhou → tenta mirror
+    # 3) mirror como último recurso
     m = await _mirror_get_concurso(n)
     if m:
         _cache_put(_caixa_cache, cache_key, m)
         return m
+
     return None
 
 # ------------------------------------------------------------------------------
