@@ -1,6 +1,6 @@
-fastapi
-uvicorn[standard]
-httpx
+fastapi==0.115.0
+uvicorn[standard]==0.30.5
+httpx==0.27.2
 beautifulsoup4
 lxml
 pydantic

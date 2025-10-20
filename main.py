@@ -1,9 +1,16 @@
-# v4.3.0 - Lotofacil API 🎯  "12 mais / 3 menos"
-# FastAPI + Playwright (Chromium) + UI embutida
-# - Parser: tenta __NEXT_DATA__ (Next.js) e faz fallback para cards do HTML
-# - Scraping rápido: domcontentloaded, bloqueio de assets pesados, timeout curto
-# - Cache simples em memória para páginas e agregados
-# ------------------------------------------------------------------------------
+# v6.2.0 - Lotofacil API 🎯 (fonte: CAIXA)
+# - Fonte oficial CAIXA (JSON)
+# - Coleta robusta com:
+#     * headers iguais ao site (X-Requested-With, Accept-Language, etc.)
+#     * anti-cache por query (_=timestamp)
+#     * fallback de hosts (servicebus2 + loterias)
+#     * fallback de rota (?concurso=N) e também /N
+#     * serialização das requisições específicas + backoff curto
+#     * validação forte: somente 15 dezenas únicas (1..25) por concurso
+# - Endpoints:
+#     /ready  /lotofacil  /stats  /parity  /app
+# - /parity: janela 1m, 3m, 1y ou custom (start/end ISO YYYY-MM-DD)
+# - UI simples (Chart.js) em /app
 
 from __future__ import annotations
 
@@ -11,47 +18,42 @@ import os
 import re
 import json
 import time
-import math
-import asyncio
 import datetime as dt
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Tuple, Optional
 
-from fastapi import FastAPI, Query, Response
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
+import httpx
+from fastapi import FastAPI, Query
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
-from playwright.async_api import (
-    async_playwright,
-    Browser,
-    TimeoutError as PWTimeoutError,
-)
+# ------------------------------------------------------------------------------
+# Config
+# ------------------------------------------------------------------------------
+APP_VERSION = "6.2.0"
 
-APP_VERSION = "4.3.0"
+CAIXA_HOSTS = [
+    "https://servicebus2.caixa.gov.br/portaldeloterias/api/lotofacil",
+    "https://loterias.caixa.gov.br/portaldeloterias/api/lotofacil",
+]
 
-BASE_URL = "https://www.sorteonline.com.br/lotofacil/resultados"
-
-# ---------- Tunáveis de performance ----------
-PW_TIMEOUT_MS = int(os.getenv("PW_TIMEOUT_MS", "12000"))  # 12s
-MAX_PAGES_DEFAULT = int(os.getenv("MAX_PAGES_DEFAULT", "6"))
-MAX_PAGES_FORCE = int(os.getenv("MAX_PAGES_FORCE", "12"))
-
-# cache TTLs
-PAGE_TTL_SEC = int(os.getenv("PAGE_TTL_SEC", "120"))        # html de cada página
-AGG_TTL_SEC = int(os.getenv("AGG_TTL_SEC", "90"))           # agregado / stats
-
-# ---------- Estado global do navegador / cache ----------
-_pw = None
-_browser: Browser | None = None
-_browser_ready = False
-
-_page_cache: Dict[str, Tuple[float, str]] = {}  # url -> (ts, html)
-_agg_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}   # key -> (ts, data)
+HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "12"))     # segs
+# reqs por leva (apenas para "últimos N")
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", "20"))
+AGG_TTL_SEC = int(os.getenv("AGG_TTL_SEC", "120"))     # cache dos agregados
+CAIXA_TTL_SEC = int(os.getenv("CAIXA_TTL_SEC", "120")
+                    )   # cache das respostas da CAIXA
 
 # ------------------------------------------------------------------------------
-# FastAPI
+# Estado global
+# ------------------------------------------------------------------------------
+_http: httpx.AsyncClient | None = None
+_caixa_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}  # key->(ts,json)
+_agg_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}  # key->(ts,payload)
+
+# ------------------------------------------------------------------------------
+# App
 # ------------------------------------------------------------------------------
 app = FastAPI(title="Lotofacil API", version=APP_VERSION)
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=True,
@@ -59,296 +61,168 @@ app.add_middleware(
 )
 
 # ------------------------------------------------------------------------------
-# Navegador
+# HTTP client
 # ------------------------------------------------------------------------------
 
-async def ensure_browser() -> Browser:
-    global _pw, _browser, _browser_ready
-    if _browser and _browser_ready:
-        return _browser
 
-    _pw = await async_playwright().start()
-    _browser = await _pw.chromium.launch(
-        headless=True,
-        args=[
-            "--no-sandbox",
-            "--disable-dev-shm-usage",
-            "--disable-gpu",
-            "--disable-features=IsolateOrigins,site-per-process",
-        ],
-    )
-    _browser_ready = True
-    return _browser
-
-
-async def close_browser():
-    global _pw, _browser, _browser_ready
-    try:
-        if _browser:
-            await _browser.close()
-    finally:
-        _browser = None
-        _browser_ready = False
-        if _pw:
-            await _pw.stop()
-            _pw = None
-
-
-async def render_page(url: str, timeout_ms: int | None = None) -> str:
-    """
-    Abre a página de forma rápida e retorna o HTML.
-    - Espera 'domcontentloaded'
-    - Bloqueia imagens / CSS / fontes
-    """
-    tmo = timeout_ms or PW_TIMEOUT_MS
-    browser = await ensure_browser()
-    context = await browser.new_context()
-    page = await context.new_page()
-
-    # Bloqueia assets pesados
-    async def _block(route):
-        if route.request.resource_type in {"image", "font", "stylesheet", "media"}:
-            return await route.abort()
-        return await route.continue_()
-    await context.route("**/*", _block)
-
-    try:
-        try:
-            await page.goto(url, timeout=tmo, wait_until="domcontentloaded")
-        except PWTimeoutError:
-            # Ainda assim podemos ter HTML útil
-            pass
-        # espera algo mínimo no DOM
-        try:
-            await page.wait_for_selector("main, body", timeout=3000)
-        except PWTimeoutError:
-            pass
-
-        html = await page.content()
-        return html
-    finally:
-        await context.close()
-
-# ------------------------------------------------------------------------------
-# Parsers
-# ------------------------------------------------------------------------------
-
-def _walk(obj: Any):
-    if isinstance(obj, dict):
-        for v in obj.values():
-            yield from _walk(v)
-    elif isinstance(obj, list):
-        yield obj
-        for v in obj:
-            yield from _walk(v)
-
-def _looks_like_draw(item: dict) -> bool:
-    """
-    Heurística para reconhecer 'um concurso' no JSON do Next.js:
-    - possui id/numero/concurso
-    - dezenas com 15 números
-    """
-    if not isinstance(item, dict):
-        return False
-
-    id_keys = ["concurso", "numero", "id"]
-    concurso = None
-    for k in id_keys:
-        if k in item:
-            try:
-                concurso = int(str(item[k]).strip())
-                break
-            except Exception:
-                pass
-    if not concurso:
-        return False
-
-    # dezenas
-    dz = (
-        item.get("dezenas")
-        or item.get("numeros")
-        or item.get("resultado")
-        or item.get("listaDezenas")
-    )
-    if not isinstance(dz, (list, tuple)) or len(dz) != 15:
-        return False
-
-    try:
-        dz = [f"{int(str(x).strip()):02d}" for x in dz]
-    except Exception:
-        return False
-
-    item["_parsed_concurso"] = concurso
-    item["_parsed_dezenas"] = dz
-
-    for dk in ["data", "dataSorteio", "dtSorteio", "data_concurso", "date"]:
-        if dk in item:
-            item["_parsed_date"] = str(item[dk])
-            break
-
-    return True
-
-
-def _normalize_draws(arr: list[dict]) -> list[dict]:
-    out: List[Dict[str, Any]] = []
-    for it in arr:
-        if _looks_like_draw(it):
-            out.append(
-                {
-                    "contest": it["_parsed_concurso"],
-                    "date": it.get("_parsed_date") or "",
-                    "numbers": [int(x) for x in it["_parsed_dezenas"]],
-                    "source": "next_data",
-                }
-            )
-    out.sort(key=lambda x: int(x["contest"]), reverse=True)
-    return out
-
-
-def parse_from_next_data(html: str) -> list[dict]:
-    m = re.search(
-        r'<script[^>]+id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.S | re.I
-    )
-    if not m:
-        return []
-    try:
-        data = json.loads(m.group(1))
-    except Exception:
-        return []
-
-    candidates: list[list[dict]] = []
-    for arr in _walk(data):
-        if not isinstance(arr, list) or not arr:
-            continue
-        sample = [x for x in arr if _looks_like_draw(x)]
-        if len(sample) >= 3:
-            candidates.append(arr)
-
-    if not candidates:
-        return []
-    best = max(candidates, key=len)
-    return _normalize_draws(best)
-
-
-def parse_from_cards(html: str) -> list[dict]:
-    """
-    Fallback simples: pega blocos com 15 números e tenta achar o 'Concurso 3511' por perto.
-    """
-    blocks = re.findall(r"(?:\D|^)((?:\d{2}[\s,;/-]+){14}\d{2})(?:\D|$)", html)
-    draws = []
-    seen = set()
-    for blk in blocks:
-        i = html.find(blk)
-        around = 150
-        snippet = html[max(0, i - around) : i + len(blk) + around]
-        m = re.search(r"Concurso[^0-9]{0,10}(\d{3,5})", snippet, re.I)
-        if not m:
-            continue
-        contest = int(m.group(1))
-        if contest in seen:
-            continue
-        nums = [int(x) for x in re.findall(r"\d{2}", blk)]
-        if len(nums) != 15:
-            continue
-        seen.add(contest)
-        draws.append(
-            {
-                "contest": contest,
-                "date": "",
-                "numbers": nums,
-                "source": "cards",
-            }
+async def ensure_http() -> httpx.AsyncClient:
+    """Cria um client httpx com headers muito próximos do site oficial."""
+    global _http
+    if _http is None:
+        _http = httpx.AsyncClient(
+            timeout=HTTP_TIMEOUT,
+            headers={
+                "user-agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                               "AppleWebKit/537.36 (KHTML, like Gecko) "
+                               "Chrome/120.0.0.0 Safari/537.36"),
+                "accept": "application/json, text/plain, */*",
+                "accept-language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
+                "x-requested-with": "XMLHttpRequest",
+                "referer": "https://loterias.caixa.gov.br/wps/portal/loterias/landing/lotofacil",
+                "origin": "https://loterias.caixa.gov.br",
+                "pragma": "no-cache",
+                "cache-control": "no-cache",
+            },
         )
-    draws.sort(key=lambda x: int(x["contest"]), reverse=True)
-    return draws
+    return _http
 
 
-def parse_concursos(html: str) -> list[dict]:
-    data = parse_from_next_data(html)
-    if data:
-        return data
-    return parse_from_cards(html)
+async def close_http():
+    global _http
+    try:
+        if _http is not None:
+            await _http.aclose()
+    finally:
+        _http = None
 
 # ------------------------------------------------------------------------------
-# Coletor paginado + cache
+# Helpers de cache
 # ------------------------------------------------------------------------------
 
-def _page_cache_get(url: str) -> str | None:
-    ent = _page_cache.get(url)
+
+def _cache_get(store: Dict[str, Tuple[float, Any]], key: str, ttl: int) -> Any | None:
+    ent = store.get(key)
     if not ent:
         return None
-    ts, html = ent
-    if time.time() - ts <= PAGE_TTL_SEC:
-        return html
+    ts, payload = ent
+    if time.time() - ts <= ttl:
+        return payload
     return None
 
 
-def _page_cache_put(url: str, html: str):
-    _page_cache[url] = (time.time(), html)
+def _cache_put(store: Dict[str, Tuple[float, Any]], key: str, payload: Any):
+    store[key] = (time.time(), payload)
 
 
-async def fetch_page_html(url: str, force: bool = False) -> str:
-    if not force:
-        cached = _page_cache_get(url)
-        if cached is not None:
-            return cached
-    html = await render_page(url)
-    _page_cache_put(url, html)
-    return html
+def _with_ts(payload: Dict[str, Any]) -> Dict[str, Any]:
+    out = dict(payload)
+    out["_ts"] = time.time()
+    return out
 
 
-async def collect_results(limit: int, force: bool = False) -> tuple[list[dict], str]:
-    """
-    Retorna (lista_de_concursos, method_usado)
-    """
-    max_pages = MAX_PAGES_FORCE if force else MAX_PAGES_DEFAULT
-    pages_by_limit = max(1, math.ceil(limit / 25))  # média ~25 por página
-    max_pages = min(max_pages, pages_by_limit)
+def _agg_key(kind: str, **params) -> str:
+    return f"{kind}:{json.dumps(params, sort_keys=True)}"
 
-    results: List[dict] = []
-    seen = set()
-    method_used = None
 
-    for page_idx in range(1, max_pages + 1):
-        url = BASE_URL if page_idx == 1 else f"{BASE_URL}?page={page_idx}"
-        html = await fetch_page_html(url, force=force)
-        part = parse_concursos(html)
-        if part:
-            if method_used is None:
-                method_used = part[0].get("source", "mixed")
-            for it in part:
-                c = int(it["contest"])
-                if c in seen:
-                    continue
-                results.append(it)
-                seen.add(c)
-                if len(results) >= limit:
-                    return results[:limit], (method_used or "mixed")
+def _agg_get(kind: str, **params) -> Dict[str, Any] | None:
+    return _cache_get(_agg_cache, _agg_key(kind, **params), AGG_TTL_SEC)
 
-        # se veio vazio, não adianta continuar paginando
-        if not part:
-            break
 
-    return results[:limit], (method_used or "mixed")
+def _agg_put(payload: Dict[str, Any], kind: str, **params):
+    _cache_put(_agg_cache, _agg_key(kind, **params), _with_ts(payload))
 
 # ------------------------------------------------------------------------------
-# Estatísticas e utilidades
+# Utilidades
 # ------------------------------------------------------------------------------
+
+
+async def _sleep_ms(ms: int):
+    import asyncio
+    await asyncio.sleep(ms / 1000.0)
+
+
+def parse_draw_date(s: str) -> Optional[dt.date]:
+    if not s:
+        return None
+    s = s.strip()
+    m = re.match(r"(\d{1,2})/(\d{1,2})/(\d{2,4})", s)  # 17/10/2025
+    if m:
+        d, M, y = m.groups()
+        d, M, y = int(d), int(M), int(y)
+        if y < 100:
+            y += 2000
+        try:
+            return dt.date(y, M, d)
+        except Exception:
+            return None
+    m = re.match(r"(\d{4})-(\d{2})-(\d{2})", s)        # 2025-10-17
+    if m:
+        y, M, d = map(int, m.groups())
+        try:
+            return dt.date(y, M, d)
+        except Exception:
+            return None
+    return None
+
+
+def window_to_range(window: str) -> Tuple[Optional[dt.date], Optional[dt.date]]:
+    """
+    Aceita: 'Xm' (1–12) ou 'all'. (Opcional: '1y' tratado como 12m.)
+    """
+    today = dt.date.today()
+
+    # alias opcional: '1y' -> '12m'
+    if window == "1y":
+        window = "12m"
+
+    # 'Xm' (meses)
+    m = re.fullmatch(r"(\d{1,2})m", window)
+    if m:
+        months = int(m.group(1))
+        if months < 1:
+            months = 1
+        if months > 12:
+            months = 12
+
+        # andar 'months' meses para trás com segurança (sem estourar dia)
+        year = today.year
+        month = today.month - months
+        while month <= 0:
+            month += 12
+            year -= 1
+        # usa min(day, 28) para evitar datas inválidas (fev, etc.)
+        start = dt.date(year, month, min(today.day, 28))
+        return start, today
+
+    # tudo
+    if window == "all":
+        return None, today
+
+    # fallback: 3m
+    return today - dt.timedelta(days=93), today
+
+
+def valid_15_unique(nums: List[int]) -> bool:
+    if len(nums) != 15:
+        return False
+    s = set(nums)
+    if len(s) != 15:
+        return False
+    for n in s:
+        if n < 1 or n > 25:
+            return False
+    return True
+
 
 def histogram_even_odd(numbers: List[int]) -> Tuple[int, int]:
     e = sum(1 for n in numbers if n % 2 == 0)
-    o = 15 - e
-    return e, o
+    return e, 15 - e
 
 
 def summarize_draws(draws: List[dict]) -> Dict[str, Any]:
-    """
-    Gera algumas estatísticas simples para /lotofacil e /stats
-    """
     hist = {"7-8": 0, "8-7": 0, "outros": 0}
     total = max(1, len(draws))
-    even_list, odd_list = [], []
-
+    evens, odds = [], []
     for d in draws:
         e, o = histogram_even_odd(d["numbers"])
         if e == 7 and o == 8:
@@ -357,91 +231,196 @@ def summarize_draws(draws: List[dict]) -> Dict[str, Any]:
             hist["8-7"] += 1
         else:
             hist["outros"] += 1
-        even_list.append(e)
-        odd_list.append(o)
-
-    avg_even = sum(even_list) / total
-    avg_odd = sum(odd_list) / total
-
-    return {"histogram": hist, "avg_even": round(avg_even, 1), "avg_odd": round(avg_odd, 1)}
+        evens.append(e)
+        odds.append(o)
+    return {"histogram": hist, "avg_even": round(sum(evens)/total, 1), "avg_odd": round(sum(odds)/total, 1)}
 
 
 def frequencies(draws: List[dict]) -> List[Dict[str, Any]]:
     counts = {n: 0 for n in range(1, 26)}
     total = max(1, len(draws))
     for d in draws:
-        for x in d["numbers"]:
+        nums = d.get("numbers") or []
+        if not valid_15_unique(nums):
+            continue
+        for x in nums:
             counts[x] += 1
-    out = []
-    for n in range(1, 26):
-        pct = (counts[n] / total) * 100.0
-        out.append({"n": n, "count": counts[n], "pct": round(pct, 1)})
-    return out
+    return [{"n": n, "count": counts[n], "pct": round((counts[n]/total)*100.0, 1)} for n in range(1, 26)]
 
 
-def build_suggestion(draws: List[dict], hi: int, lo: int) -> Dict[str, Any]:
-    """
-    Heurística "12 mais / 3 menos" (ou o par hi/lo informado):
-    - Ordena dezenas por frequência (desc)
-    - Pega 'hi' do topo e 'lo' do fim, totalizando 15
-    """
-    hi = max(0, min(15, int(hi)))
-    lo = max(0, min(15 - hi, int(lo)))
-    # fallback p/ 12/3
-    if hi + lo != 15:
-        hi, lo = 12, 3
-
-    # contagem
+def build_parity_suggestion(draws: List[dict], even_needed: int = 8, odd_needed: int = 7) -> Dict[str, Any]:
+    even_needed = max(0, min(15, even_needed))
+    odd_needed = max(0, min(15 - even_needed, odd_needed))
+    if even_needed + odd_needed != 15:
+        even_needed, odd_needed = 8, 7
     freq = frequencies(draws)
-    # ordena: mais frequentes primeiro, depois número
-    freq_sorted = sorted(freq, key=lambda x: (-x["count"], x["n"]))
-
-    hi_nums = [x["n"] for x in freq_sorted[:hi]]
-    lo_nums = [x["n"] for x in sorted(freq_sorted[-lo:], key=lambda x: (x["count"], x["n"]))]
-
-    combo = sorted([*hi_nums, *lo_nums])
-    even = [n for n in combo if n % 2 == 0]
-    odd = [n for n in combo if n % 2 == 1]
-
-    pattern = f"{len(even)}-{len(odd)}"
-
+    ev = sorted([f for f in freq if f["n"] % 2 == 0],
+                key=lambda x: (-x["count"], x["n"]))[:even_needed]
+    od = sorted([f for f in freq if f["n"] % 2 == 1],
+                key=lambda x: (-x["count"], x["n"]))[:odd_needed]
+    chosen_even = [x["n"] for x in ev]
+    chosen_odd = [x["n"] for x in od]
+    combo = sorted(chosen_even + chosen_odd)
     return {
-        "hi": hi_nums,
-        "lo": lo_nums,
-        "combo": combo,
-        "parity": {
-            "even_count": len(even),
-            "odd_count": len(odd),
-            "even": even,
-            "odd": odd,
-        },
-        "pattern": pattern,
+        "even": chosen_even, "odd": chosen_odd, "combo": combo,
+        "parity": {"even_count": even_needed, "odd_count": odd_needed},
+        "pattern": f"{even_needed}-{odd_needed}",
     }
 
 # ------------------------------------------------------------------------------
-# Cache de agregados
+# CAIXA API – normalização + chamadas robustas
 # ------------------------------------------------------------------------------
 
-def _agg_key(kind: str, **params) -> str:
-    return f"{kind}:{json.dumps(params, sort_keys=True)}"
 
-
-def _agg_get(kind: str, **params) -> Dict[str, Any] | None:
-    ent = _agg_cache.get(_agg_key(kind, **params))
-    if not ent:
+def _normalize_json(j: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    Normaliza UM concurso e valida:
+      - 15 dezenas únicas ∈ [1..25]
+    """
+    try:
+        numero = int(j.get("numero"))
+        dezenas = j.get("listaDezenas") or j.get("dezenas") or []
+        nums = [int(str(x)) for x in dezenas]
+        if not valid_15_unique(nums):
+            return None
+        date = str(j.get("dataApuracao") or j.get("data") or "")
+        e, o = histogram_even_odd(nums)
+        return {"contest": numero, "date": date, "numbers": nums,
+                "even_count": e, "odd_count": o, "source": "caixa"}
+    except Exception:
         return None
-    ts, payload = ent
-    if time.time() - ts <= AGG_TTL_SEC:
-        return payload
+
+
+async def _caixa_get_latest() -> Dict[str, Any]:
+    cache_key = "latest"
+    cached = _cache_get(_caixa_cache, cache_key, CAIXA_TTL_SEC)
+    if cached:
+        return cached
+    client = await ensure_http()
+    # pegamos do primeiro host; se falhar, tentamos o segundo
+    for base in CAIXA_HOSTS:
+        try:
+            r = await client.get(base, params={"_": int(time.time()*1000)}, follow_redirects=True)
+            r.raise_for_status()
+            j = r.json()
+            data = _normalize_json(j)
+            if not data:  # ainda que falhe a normalização, devolvemos ao menos o número
+                data = {"contest": int(j.get("numero", 0)), "date": j.get(
+                    "dataApuracao") or "", "numbers": [], "source": "caixa"}
+            _cache_put(_caixa_cache, cache_key, data)
+            return data
+        except httpx.HTTPError:
+            continue
+    # se tudo falhar, devolvemos um placeholder
+    return {"contest": 0, "date": "", "numbers": [], "source": "caixa"}
+
+
+async def _caixa_get_concurso(n: int) -> Optional[Dict[str, Any]]:
+    """
+    Busca 1 concurso específico, tentando:
+      - ?concurso=N com anti-cache
+      - /N com anti-cache
+    Valida que j['numero'] == N (senão a API devolveu o último; descartamos).
+    Serializado + backoff curto para driblar caches intermediários.
+    """
+    cache_key = f"c:{n}"
+    cached = _cache_get(_caixa_cache, cache_key, CAIXA_TTL_SEC)
+    if cached:
+        return cached
+
+    client = await ensure_http()
+    ts = int(time.time() * 1000)
+    variants = []
+    for base in CAIXA_HOSTS:
+        variants.append({"url": base,      "params": {"concurso": n, "_": ts}})
+        variants.append({"url": f"{base}/{n}", "params": {"_": ts}})
+
+    for item in variants:
+        try:
+            r = await client.get(item["url"], params=item["params"], follow_redirects=True)
+            if r.status_code == 404:
+                await _sleep_ms(60)
+                continue
+            r.raise_for_status()
+            j = r.json()
+            if int(j.get("numero", 0)) != int(n):
+                # API ignorou o parâmetro -> tenta próxima variante
+                await _sleep_ms(60)
+                continue
+            data = _normalize_json(j)
+            if not data:
+                await _sleep_ms(60)
+                continue
+            _cache_put(_caixa_cache, cache_key, data)
+            return data
+        except httpx.HTTPError:
+            await _sleep_ms(80)
+            continue
     return None
 
+# ------------------------------------------------------------------------------
+# Coleta (últimos N) e por janela
+# ------------------------------------------------------------------------------
 
-def _agg_put(payload: Dict[str, Any], kind: str, **params):
-    _agg_cache[_agg_key(kind, **params)] = (time.time(), payload)
+
+async def collect_last_n(limit: int) -> list[dict]:
+    """Coleta os últimos `limit` concursos válidos (15 dezenas)."""
+    latest = await _caixa_get_latest()
+    last_n = int(latest.get("contest") or 0)
+    if last_n <= 0:
+        return []
+    results: List[dict] = []
+    n = last_n
+    while n >= 1 and len(results) < limit:
+        # serialização de N em N (evita a API confundir resposta)
+        got = await _caixa_get_concurso(n)
+        if got:
+            results.append(got)
+        n -= 1
+    return results[:limit]
+
+
+async def collect_by_date(start: Optional[dt.date], end: Optional[dt.date], max_fetch: int = 400) -> list[dict]:
+    """
+    Busca concursos decrescendo até cobrir a janela [start, end].
+    Como o endpoint específico sofre com cache, mantemos serializado.
+    """
+    latest = await _caixa_get_latest()
+    last_n = int(latest.get("contest") or 0)
+    if last_n <= 0:
+        return []
+
+    results: List[dict] = []
+    fetched = 0
+    n = last_n
+
+    while n >= 1 and fetched < max_fetch:
+        d = await _caixa_get_concurso(n)
+        fetched += 1
+        n -= 1
+        if not d:
+            continue
+        dd = parse_draw_date(d.get("date") or "")
+        if dd is None:
+            continue
+        if start and dd < start:
+            # já cruzamos o início da janela; se já temos algo, podemos encerrar
+            if results:
+                break
+            else:
+                continue
+        if end and dd > end:
+            continue
+        results.append(d)
+
+    # ordenar desc por concurso
+    results.sort(key=lambda x: int(x["contest"]), reverse=True)
+    return results
 
 # ------------------------------------------------------------------------------
 # Endpoints
 # ------------------------------------------------------------------------------
+
 
 @app.get("/", response_class=JSONResponse)
 async def root():
@@ -449,12 +428,10 @@ async def root():
         "message": "Lotofacil API está online!",
         "version": APP_VERSION,
         "docs": "/docs",
-        "health": "/health",
-        "ready": "/ready",
         "examples": {
-            "debug": "/debug?page=1",
-            "lotofacil": "/lotofacil?limit=60",
+            "lotofacil": "/lotofacil?limit=10",
             "stats": "/stats?limit=60&hi=12&lo=3",
+            "parity": "/parity?window=3m&even=8&odd=7",
         },
     }
 
@@ -467,104 +444,148 @@ async def health():
 @app.get("/ready", response_class=JSONResponse)
 async def ready():
     try:
-        await ensure_browser()
-        return {"status": "ok", "chromium": True}
-    except Exception:
-        return {"status": "fail", "chromium": False}
-
-
-@app.get("/debug", response_class=JSONResponse)
-async def debug(page: int = Query(1, ge=1), force: bool = False):
-    url = BASE_URL if page == 1 else f"{BASE_URL}?page={page}"
-    html = await fetch_page_html(url, force=force)
-    snippet = html[:1000]
-    return {"page": page, "len": len(html), "snippet": snippet}
+        latest = await _caixa_get_latest()
+        ok = bool(latest and latest.get("contest"))
+        return {"status": "ok" if ok else "warn", "http": True, "latest_contest": latest.get("contest")}
+    except Exception as e:
+        return {"status": "fail", "http": False, "error": str(e)}
 
 
 @app.get("/lotofacil", response_class=JSONResponse)
-async def lotofacil(
-    limit: int = Query(60, ge=1, le=500),
-    force: bool = False,
-):
-    # cache
+async def lotofacil(limit: int = Query(10, ge=1, le=200), force: bool = False):
     cache = None if force else _agg_get("lotofacil", limit=limit)
     if cache:
-        cache_age = int(time.time() - cache["_ts"])
         data = cache.copy()
-        data["cache_age_seconds"] = cache_age
+        ts = data.get("_ts")
+        data["cache_age_seconds"] = int(time.time() - ts) if ts else None
+        data.pop("_ts", None)
         return data
 
-    draws, method = await collect_results(limit=limit, force=force)
-    # resumo por paridade
-    for d in draws:
-        e, o = histogram_even_odd(d["numbers"])
-        d["even_count"], d["odd_count"] = e, o
-
-    data = {
+    draws = await collect_last_n(limit)
+    payload = {
         "ok": True,
         "count": len(draws),
         "limit": limit,
         "summary": summarize_draws(draws),
         "results": draws,
-        "method": method,
-        "source_url": BASE_URL,
+        "method": "caixa",
+        "source_url": CAIXA_HOSTS[0],
         "cache_age_seconds": None,
     }
-    data["_ts"] = time.time()
-    _agg_put(data, "lotofacil", limit=limit)
-    data.pop("_ts", None)
-    return data
+    _agg_put(payload, "lotofacil", limit=limit)
+    payload["cache_age_seconds"] = 0
+    return payload
 
 
 @app.get("/stats", response_class=JSONResponse)
 async def stats(
-    limit: int = Query(60, ge=1, le=500),
+    limit: int = Query(60, ge=1, le=200),
     hi: int = Query(12, ge=0, le=15),
     lo: int = Query(3, ge=0, le=15),
     force: bool = False,
 ):
-    # normaliza hi/lo p/ total 15
     hi = max(0, min(15, hi))
     lo = max(0, min(15 - hi, lo))
     if hi + lo != 15:
         hi, lo = 12, 3
 
-    # cache
     cache = None if force else _agg_get("stats", limit=limit, hi=hi, lo=lo)
     if cache:
-        cache_age = int(time.time() - cache["_ts"])
         data = cache.copy()
-        data["cache_age_seconds"] = cache_age
+        ts = data.get("_ts")
+        data["cache_age_seconds"] = int(time.time() - ts) if ts else None
+        data.pop("_ts", None)
         return data
 
-    draws, method = await collect_results(limit=limit, force=force)
+    draws = await collect_last_n(limit)
     freqs = frequencies(draws)
-    sugg = build_suggestion(draws, hi=hi, lo=lo)
+    sugg = build_parity_suggestion(draws, even_needed=8, odd_needed=7)
 
-    data = {
+    payload = {
         "ok": True,
         "considered_games": len(draws),
         "limit": limit,
-        "hi": hi,
-        "lo": lo,
+        "hi": hi, "lo": lo,
+        "frequencies": freqs,
+        "suggestion": {
+            "hi": [x["n"] for x in sorted(freqs, key=lambda x: (-x["count"], x["n"]))[:hi]],
+            "lo": [x["n"] for x in sorted(freqs, key=lambda x: (x["count"], x["n"]))[:lo]],
+            "combo": sorted(
+                [x["n"]
+                    for x in sorted(freqs, key=lambda x: (-x["count"], x["n"]))[:hi]]
+                + [x["n"]
+                    for x in sorted(freqs, key=lambda x: (x["count"], x["n"]))[:lo]]
+            ),
+            "pattern": "n/a",
+        },
+        "parity_pattern_example": sugg["pattern"],
+        "method": "caixa",
+        "updated_at": dt.datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
+        "source_url": CAIXA_HOSTS[0],
+        "cache_age_seconds": None,
+    }
+    _agg_put(payload, "stats", limit=limit, hi=hi, lo=lo)
+    payload["cache_age_seconds"] = 0
+    return payload
+
+
+@app.get("/parity", response_class=JSONResponse)
+async def parity(
+    window: str = Query("3m", pattern=r"^((\d{1,2})m|all)$"),
+    start: Optional[str] = None,
+    end: Optional[str] = None,
+    even: int = Query(8, ge=0, le=15),
+    odd: int = Query(7, ge=0, le=15),
+    force: bool = False,
+):
+
+    cache = None if force else _agg_get(
+        "parity", window=window, start=start, end=end, even=even, odd=odd)
+    if cache:
+        data = cache.copy()
+        ts = data.get("_ts")
+        data["cache_age_seconds"] = int(time.time() - ts) if ts else None
+        data.pop("_ts", None)
+        return data
+
+    if start or end:
+        sd = dt.date.fromisoformat(start) if start else None
+        ed = dt.date.fromisoformat(end) if end else None
+    else:
+        sd, ed = window_to_range(window)
+
+    draws = await collect_by_date(sd, ed, max_fetch=400)
+
+    sugg = build_parity_suggestion(draws, even_needed=even, odd_needed=odd)
+    freqs = frequencies(draws)
+
+    payload = {
+        "ok": True,
+        "considered_games": len(draws),
+        "window": window,
+        "start": sd.isoformat() if sd else None,
+        "end":   ed.isoformat() if ed else None,
+        "even": even, "odd": odd,
         "frequencies": freqs,
         "suggestion": sugg,
         "pattern": sugg["pattern"],
-        "method": method,
+        "method": "caixa",
         "updated_at": dt.datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
-        "source_url": BASE_URL,
+        "source_url": CAIXA_HOSTS[0],
         "cache_age_seconds": None,
     }
-    data["_ts"] = time.time()
-    _agg_put(data, "stats", limit=limit, hi=hi, lo=lo)
-    data.pop("_ts", None)
-    return data
+    _agg_put(payload, "parity", window=window,
+             start=start, end=end, even=even, odd=odd)
+    payload["cache_age_seconds"] = 0
+    return payload
+
+# ------------------------------------------------------------------------------
+# UI simples
+# ------------------------------------------------------------------------------
 
 
-# ---------------------------- UI /app -----------------------------------------
 @app.get("/app", response_class=HTMLResponse)
 async def ui():
-    # UI simples (tailwind + chart.js) — mesma estrutura que você já usa
     return HTMLResponse(
         """
 <!doctype html>
@@ -572,7 +593,7 @@ async def ui():
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Lotofácil – 12 mais / 3 menos</title>
+  <title>Lotofácil – 8 pares / 7 ímpares</title>
   <style>
     :root { color-scheme: dark; }
     body { background:#0f172a; color:#e2e8f0; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto; }
@@ -580,7 +601,7 @@ async def ui():
     .card { background:#0b1220; border:1px solid #1e293b; border-radius:12px; padding:16px; margin:16px 0; }
     .title { font-weight:700; font-size:18px; margin-bottom:8px; }
     .row { display:flex; gap:12px; align-items:center; flex-wrap:wrap; }
-    input, button { background:#0b1220; color:#e2e8f0; border:1px solid #1e293b; border-radius:10px; padding:10px 12px; }
+    input, select, button { background:#0b1220; color:#e2e8f0; border:1px solid #1e293b; border-radius:10px; padding:10px 12px; }
     button { cursor:pointer; }
     .pill { border-radius:999px; padding:10px 14px; border:1px solid #1e293b; }
     .ball { width:60px; height:60px; border-radius:999px; display:flex; align-items:center; justify-content:center; font-weight:700; font-size:18px; margin:8px; }
@@ -595,16 +616,39 @@ async def ui():
 </head>
 <body>
 <div class="wrap">
-  <h2>Lotofácil – 12 mais / 3 menos</h2>
+  <h2>Lotofácil – 8 pares / 7 ímpares</h2>
 
   <div class="card">
     <div class="row">
-      <div>Concursos (limit)</div>
-      <input id="inpLimit" type="number" value="60" min="1" max="500" />
-      <div>Mais (hi)</div>
-      <input id="inpHi" type="number" value="12" min="0" max="15" />
-      <div>Menos (lo)</div>
-      <input id="inpLo" type="number" value="3" min="0" max="15" />
+      <div>Janela</div>
+      <select id="selWindow"></select>
+        <script>
+        // preencher select com 1..12 meses + "Tudo"
+        (function fillWindowOptions(){
+            const sel = document.getElementById('selWindow');
+            for (let m = 1; m <= 12; m++) {
+            const opt = document.createElement('option');
+            opt.value = `${m}m`;
+            opt.textContent = m === 1 ? '1 mês' : `${m} meses`;
+            if (m === 3) opt.selected = true; // padrão 3m
+            sel.appendChild(opt);
+            }
+            const all = document.createElement('option');
+            all.value = 'all';
+            all.textContent = 'Tudo';
+            sel.appendChild(all);
+        })();
+        </script>
+
+
+      <div>Custom:</div>
+      <input id="inpStart" type="date" />
+      <input id="inpEnd" type="date" />
+
+      <div>Pares</div>
+      <input id="inpEven" type="number" value="8" min="0" max="15" />
+      <div>Ímpares</div>
+      <input id="inpOdd" type="number" value="7" min="0" max="15" />
       <label class="row"><input id="chkForce" type="checkbox" />&nbsp;Forçar atualização</label>
       <button onclick="loadAll()">Atualizar</button>
     </div>
@@ -613,25 +657,25 @@ async def ui():
 
   <div class="card">
     <div class="row" style="justify-content:space-between;">
-      <div class="title">Combinação sugerida <span class="pill" id="pillDezenas">15 dezenas</span> <span class="pill" id="pillParidade">7-8 (pares/ímpares)</span></div>
+      <div class="title">Combinação sugerida <span class="pill" id="pillParidade">8-7 (pares/ímpares)</span></div>
     </div>
     <div id="suggBalls" class="row"></div>
   </div>
 
   <div class="card">
-    <div class="title">Frequência por dezena</div>
+    <div class="title">Frequência por dezena (na janela)</div>
     <canvas id="chartFreq"></canvas>
   </div>
 
   <div class="card">
-    <div class="title">Últimos concursos</div>
+    <div class="title">Amostra (10 últimos)</div>
     <table id="tbl">
       <thead><tr><th>Concurso</th><th>Data</th><th>Dezenas</th><th>Padrão</th></tr></thead>
       <tbody></tbody>
     </table>
   </div>
 
-  <div class="muted">Fonte: Sorte Online · API pessoal · v""" + APP_VERSION + """</div>
+  <div class="muted">Fonte: CAIXA · API pessoal · v""" + APP_VERSION + """</div>
 </div>
 
 <script>
@@ -641,38 +685,52 @@ async function fetchJSON(url) {
   return await res.json();
 }
 
-function ball(n, good=true) {
-  const cls = good ? 'g' : 'r';
+function ball(n) {
+  const cls = (n % 2 === 0) ? 'g' : 'r';
   return `<div class="ball ${cls}">${String(n).padStart(2,'0')}</div>`;
 }
 
 let freqChart = null;
 
 async function loadAll() {
-  const L = document.getElementById('inpLimit').value || 60;
-  const HI = document.getElementById('inpHi').value || 12;
-  const LO = document.getElementById('inpLo').value || 3;
+  const w = document.getElementById('selWindow').value;
+  const start = document.getElementById('inpStart').value;
+  const end = document.getElementById('inpEnd').value;
+  const E = document.getElementById('inpEven').value || 8;
+  const O = document.getElementById('inpOdd').value || 7;
   const force = document.getElementById('chkForce').checked ? '&force=true' : '';
 
-  const stats = await fetchJSON(`/stats?limit=${L}&hi=${HI}&lo=${LO}${force}`);
-  const lotos = await fetchJSON(`/lotofacil?limit=${L}${force}`);
+  let url = `/parity?window=${w}&even=${E}&odd=${O}${force}`;
+  if (start || end) {
+    const s = start ? `&start=${start}` : '';
+    const e = end ? `&end=${end}` : '';
+    url = `/parity?even=${E}&odd=${O}${s}${e}${force}`;
+  }
 
+  // 👉 pega os dados da paridade e, em paralelo, o último concurso em /ready
+  const [p, rdy] = await Promise.all([
+    fetchJSON(url),
+    fetchJSON('/ready')
+  ]);
+
+  // compatível com a resposta do /ready deste backend (latest_contest)
+  const latestContest = rdy?.latest_contest ?? '—';
+
+  // 👉 aqui adicionamos "concurso mais atual: XX" na mesma linha
   document.getElementById('meta').innerText =
-    `método: ${stats.method} · Atualizado: ${stats.updated_at} · jogos considerados: ${stats.considered_games}`;
+    `método: ${p.method} · Atualizado: ${p.updated_at} · jogos considerados: ${p.considered_games} · ` +
+    `janela: ${p.start || '—'} → ${p.end || '—'} · concurso mais atual: ${latestContest}`;
 
   // Sugerida
-  const s = stats.suggestion;
-  document.getElementById('pillDezenas').innerText = '15 dezenas';
+  const s = p.suggestion;
   document.getElementById('pillParidade').innerText = s.pattern + ' (pares/ímpares)';
   let html = '';
-  const good = new Set(s.hi);
-  const bad = new Set(s.lo);
-  for (const n of s.combo) html += ball(n, good.has(n));
+  for (const n of s.combo) html += ball(n);
   document.getElementById('suggBalls').innerHTML = html;
 
   // Frequências
-  const labels = stats.frequencies.map(x => String(x.n).padStart(2,'0'));
-  const data = stats.frequencies.map(x => x.count);
+  const labels = p.frequencies.map(x => String(x.n).padStart(2,'0'));
+  const data = p.frequencies.map(x => x.count);
   if (freqChart) freqChart.destroy();
   const ctx = document.getElementById('chartFreq');
   freqChart = new Chart(ctx, {
@@ -681,10 +739,11 @@ async function loadAll() {
     options: { responsive:true, plugins:{legend:{display:false}} }
   });
 
-  // Tabela
+  // Tabela de amostra (10 últimos)
+  const lotos = await fetchJSON('/lotofacil?limit=10');
   const tb = document.querySelector('#tbl tbody');
   tb.innerHTML = '';
-  for (const r of lotos.results.slice(0, 10)) {
+  for (const r of lotos.results) {
     const padrao = `${r.even_count}-${r.odd_count}`;
     const nums = r.numbers.map(n => String(n).padStart(2,'0')).join(' ');
     const tr = `<tr><td>${r.contest}</td><td>${r.date||''}</td><td>${nums}</td><td>${padrao}</td></tr>`;
@@ -699,20 +758,6 @@ loadAll();
     )
 
 
-# ------------------------------------------------------------------------------
-# Lifecycle
-# ------------------------------------------------------------------------------
-
-@app.on_event("startup")
-async def _startup():
-    # inicializa preguiçoso, mas garante chromium no /ready
-    pass
-
-
 @app.on_event("shutdown")
 async def _shutdown():
-    await close_browser()
-
-# ------------------------------------------------------------------------------
-# Fim
-# ------------------------------------------------------------------------------
+    await close_http()
