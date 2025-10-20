@@ -807,7 +807,44 @@ function fromNow(iso) {{
   }} catch(e) {{ return ''; }}
 }}
 
+/      // helpers BR (datas e "há X tempo") -------------------------------
+      // Converte "YYYY-MM-DD" -> "DD-MM-YYYY"
+      function brDate(iso) {{
+        if (!iso) return '';
+        const [y, m, d] = iso.split('-');
+        return `${{d}}-${{m}}-${{y}}`;
+      }}
+
+      // Converte "DD/MM/YYYY HH:MM:SS" em Date (BR -> Date JS)
+      function parseBRDateTime(s) {{
+        if (!s) return null;
+        const [d, t = '00:00:00'] = s.split(' ');
+        const [dd, mm, yy] = d.split('/').map(Number);
+        const [hh, mi, ss] = t.split(':').map(Number);
+        return new Date(yy, (mm - 1), dd, hh, mi, ss || 0);
+      }}
+
+      // "há X segundos/minutos/horas"
+      function agoBR(s) {{
+        const dt = parseBRDateTime(s);
+        if (!dt) return '';
+        const diff = Math.max(0, (Date.now() - dt.getTime()) / 1000); // seg
+        if (diff < 60) {{
+          const v = Math.round(diff);
+          return `há ${{v}} segundo${{v !== 1 ? 's' : ''}}`;
+        }}
+        if (diff < 3600) {{
+          const v = Math.round(diff / 60);
+          return `há ${{v}} minuto${{v !== 1 ? 's' : ''}}`;
+        }}
+        const v = Math.round(diff / 3600);
+        return `há ${{v}} hora${{v !== 1 ? 's' : ''}}`;
+      }}
+      // -----------------------------------------------------------------
+
+
 let freqChart=null;
+
 
 async function loadAll(){{
   const w=document.getElementById('selWindow').value;
@@ -821,14 +858,17 @@ async function loadAll(){{
 
   const [p,rdy] = await Promise.all([ j(url), j('/ready') ]);
   const latest = rdy?.latest_contest ?? '—';
-
+  
+  
   // badges
-  const updated = formatPtBrDateTime(p.updated_at || '');
-  const ago = fromNow(p.updated_at || '');
-  document.getElementById('bdUpdated').innerText = `${{updated}}${{ago?' · '+ago:''}}`;
-  document.getElementById('bdWindow').innerText = `${{p.start||'—'}} → ${{p.end||'—'}}`;
-  document.getElementById('bdGames').innerText = p.considered_games ?? '—';
-  document.getElementById('bdLatest').innerText = latest;
+  const updated = p.updated_at || '';
+  const ago = agoBR(updated);
+  document.getElementById('bdupdated').innerText =
+    `${{updated}}${{ago ? ' · ' + ago : ''}}`;
+
+  document.getElementById('bdwindow').innerText =
+    `${{isoToBRDash(p.start) || '—'}} → ${{isoToBRDash(p.end) || '—'}}`;
+
 
   // sugestão
   const s=p.suggestion; document.getElementById('pillParidade').innerText = s.pattern+' (pares/ímpares)';
