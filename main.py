@@ -748,7 +748,7 @@ canvas {{ width:100%; height:260px; }}
 
 <script>
 async function j(url){{const r=await fetch(url);if(!r.ok)throw new Error('HTTP '+r.status);return r.json();}}
-function ball(n){{const c=(n%2===0)?'g':'r';return `<div class="ball ${c}">${String(n).padStart(2,'0')}</div>`;}}
+function ball(n){{const c=(n%2===0)?'g':'r';return `<div class="ball ${{c}}">${{String(n).padStart(2,'0')}}</div>`;}}
 let freqChart=null;
 
 async function loadAll(){{
