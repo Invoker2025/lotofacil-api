@@ -710,7 +710,7 @@ async def ui():
 <head>
 <meta charset="utf-8" />
 <title>Lotofácil</title>
-<link rel="manifest" href="/static/manifest.webmanifest" type="application/manifest+json">
+<link rel="manifest" href="/static/manifest.webmanifest?v=2" type="application/manifest+json">
 <link rel="apple-touch-icon" href="/static/apple-touch-icon.png">
 <link rel="icon" href="/static/favicon.ico">
 <meta name="theme-color" content="#0f172a">
