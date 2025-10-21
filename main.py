@@ -801,6 +801,16 @@ canvas{ width:100%; height:260px; }
 
 <script>
 function pad2(n){ return String(n).padStart(2,'0'); }
+
+// >>> NOVO: converte 'aaaa-mm-dd' para 'dd-mm-aaaa' (padrão BR)
+function formatBRDate(iso){
+  if(!iso) return '';
+  try{
+    const [y,m,d] = iso.split('-').map(Number);
+    return `${pad2(d)}-${pad2(m)}-${y}`;
+  }catch(e){ return iso; }
+}
+
 function formatBrDateTime(s){
   if(!s) return '';
   try{
