@@ -1,12 +1,12 @@
-# Lotofacil API – v6.5.0
+# Lotofacil API – v6.5.1
 # - Coleta resultados da Lotofácil com 3 níveis:
 #     1) Mirror público (opcionalmente preferido)
 #     2) JSON oficial (Portal de Loterias CAIXA)
 #     3) HTML oficial (página de resultados: scraping tolerante)
-# - UI simples em /app, /ready mostra latest_contest, sem Chromium.
+# - UI simples em /app; /ready mostra latest_contest; ícones e PWA em /static.
 
 from __future__ import annotations
-from fastapi.responses import HTMLResponse
+import logging
 
 import os
 import re
@@ -14,13 +14,59 @@ import json
 import time
 import datetime as dt
 from typing import Any, Dict, List, Tuple, Optional
+from pathlib import Path
 
 import httpx
 from fastapi import FastAPI, Query
-from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 
-APP_VERSION = "6.5.0"
+# ----------------------------------------------------------------------
+# Paths / versão
+# ----------------------------------------------------------------------
+BASE_DIR = Path(__file__).parent
+STATIC_DIR = (BASE_DIR / "static").resolve()
+APP_VERSION = "6.5.1"
+
+# ----------------------------------------------------------------------
+# App
+# ----------------------------------------------------------------------
+app = FastAPI(title="Lotofácil API", version=APP_VERSION)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], allow_credentials=True,
+    allow_methods=["*"], allow_headers=["*"],
+)
+# Sirva a pasta "static" (ícones/manifest/sw)
+app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+# --- DIAGNÓSTICO /static (útil pra 404) -------------------------------
+logger = logging.getLogger("uvicorn.error")
+
+
+@app.on_event("startup")
+async def _log_static_at_startup():
+    try:
+        files = sorted(os.listdir(STATIC_DIR))
+        logger.info(f"[STATIC] dir = {STATIC_DIR.resolve()}")
+        logger.info(f"[STATIC] files = {files}")
+    except Exception as e:
+        logger.error(f"[STATIC] erro listando: {e}")
+
+
+@app.get("/_debug/static")
+def _debug_static():
+    try:
+        return {
+            "cwd": os.getcwd(),
+            "static_dir": str(STATIC_DIR.resolve()),
+            "files": sorted(os.listdir(STATIC_DIR)),
+        }
+    except Exception as e:
+        return {"error": str(e)}
+# ----------------------------------------------------------------------
+
 
 # --- Origens CAIXA (JSON oficial) ---
 CAIXA_HOSTS = [
@@ -31,7 +77,6 @@ CAIXA_HOSTS = [
 # --- Página oficial (HTML) para scraping ---
 CAIXA_HTML_URLS = [
     "https://loterias.caixa.gov.br/Paginas/Lotofacil.aspx",
-    # tentativa direta com query
     "https://loterias.caixa.gov.br/Paginas/Lotofacil.aspx?concurso={n}",
 ]
 
@@ -44,19 +89,9 @@ AGG_TTL_SEC = int(os.getenv("AGG_TTL_SEC", "120"))
 CAIXA_TTL_SEC = int(os.getenv("CAIXA_TTL_SEC", "120"))
 PREFER_MIRROR = os.getenv("PREFER_MIRROR", "0") == "1"
 
-# ------------------------------------------------------------------------------
-# App
-# ------------------------------------------------------------------------------
-app = FastAPI(title="Lotofacil API", version=APP_VERSION)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"], allow_credentials=True,
-    allow_methods=["*"], allow_headers=["*"],
-)
-
-# ------------------------------------------------------------------------------
-# HTTP client
-# ------------------------------------------------------------------------------
+# ----------------------------------------------------------------------
+# HTTP client + caches
+# ----------------------------------------------------------------------
 _http: httpx.AsyncClient | None = None
 _caixa_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
 _agg_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
@@ -70,7 +105,7 @@ async def ensure_http() -> httpx.AsyncClient:
             headers={
                 "user-agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                               "Chrome/120.0.0.0 Safari/537.36"),
+                               "Chrome/120.0 Safari/537.36"),
                 "accept": "text/html,application/json;q=0.9,*/*;q=0.8",
                 "accept-language": "pt-BR,pt;q=0.9,en-US;q=0.8,en;q=0.7",
                 "pragma": "no-cache",
@@ -90,10 +125,6 @@ async def close_http():
             await _http.aclose()
     finally:
         _http = None
-
-# ------------------------------------------------------------------------------
-# Cache helpers
-# ------------------------------------------------------------------------------
 
 
 def _cache_get(store: Dict[str, Tuple[float, Any]], key: str, ttl: int) -> Any | None:
@@ -127,9 +158,9 @@ def _agg_get(kind: str, **params) -> Dict[str, Any] | None:
 def _agg_put(payload: Dict[str, Any], kind: str, **params):
     _cache_put(_agg_cache, _agg_key(kind, **params), _with_ts(payload))
 
-# ------------------------------------------------------------------------------
+# ----------------------------------------------------------------------
 # Utils
-# ------------------------------------------------------------------------------
+# ----------------------------------------------------------------------
 
 
 def parse_draw_date(s: str) -> Optional[dt.date]:
@@ -179,7 +210,11 @@ def summarize_draws(draws: List[dict]) -> Dict[str, Any]:
             hist["outros"] += 1
         evens.append(e)
         odds.append(o)
-    return {"histogram": hist, "avg_even": round(sum(evens)/total, 1), "avg_odd": round(sum(odds)/total, 1)}
+    return {
+        "histogram": hist,
+        "avg_even": round(sum(evens) / total, 1),
+        "avg_odd":  round(sum(odds) / total, 1),
+    }
 
 
 def frequencies(draws: List[dict]) -> List[Dict[str, Any]]:
@@ -229,22 +264,18 @@ def window_to_range(window: str) -> Tuple[Optional[dt.date], Optional[dt.date]]:
         return None, today
     return today - dt.timedelta(days=93), today
 
-# ------------------------------------------------------------------------------
-# Normalizadores e coletores (Mirror / JSON / HTML)
-# ------------------------------------------------------------------------------
+# ----------------------------------------------------------------------
+# Normalizadores e coletores
+# ----------------------------------------------------------------------
 
 
 def _normalize_from_any(j: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """
-    Aceita tanto o JSON oficial da CAIXA quanto o do mirror.
-    """
+    """Aceita tanto o JSON oficial da CAIXA quanto o do mirror."""
     try:
-        # CAIXA: numero / listaDezenas
         numero = j.get("numero")
         dezenas = j.get("listaDezenas")
         data = j.get("dataApuracao") or j.get("data")
         if numero is None:
-            # Mirror: concurso / dezenas
             numero = j.get("concurso")
             dezenas = dezenas or j.get("dezenas")
         if numero is None or dezenas is None:
@@ -258,7 +289,8 @@ def _normalize_from_any(j: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             "contest": n_concurso,
             "date": str(data or ""),
             "numbers": nums,
-            "even_count": e, "odd_count": o,
+            "even_count": e,
+            "odd_count": o,
             "source": "caixa",
         }
     except Exception:
@@ -337,7 +369,6 @@ async def _json_get_concurso(n: int) -> Optional[Dict[str, Any]]:
             continue
     return None
 
-# ---------------- HTML SCRAPER ----------------
 _HTML_RE_CONCURSO = re.compile(
     r"Concurso\s+(\d+)\s*\((\d{2}/\d{2}/\d{4})\)", re.I)
 # captura 0..29; filtraremos 1..25
@@ -345,8 +376,7 @@ _HTML_RE_NUM = re.compile(r"\b([0-2]?\d)\b")
 
 
 def _pick_15_numbers_near(html: str, anchor: int) -> Optional[List[int]]:
-    # Pega uma janela perto do título e extrai os primeiros 15 números 1..25
-    segment = html[anchor: anchor+4000]
+    segment = html[anchor: anchor + 4000]
     raw = [int(x) for x in _HTML_RE_NUM.findall(segment)]
     nums: List[int] = []
     for v in raw:
@@ -359,7 +389,7 @@ def _pick_15_numbers_near(html: str, anchor: int) -> Optional[List[int]]:
 
 async def _html_get_latest() -> Optional[Dict[str, Any]]:
     c = await ensure_http()
-    for url in CAIXA_HTML_URLS[:1]:  # primeira URL = "último"
+    for url in CAIXA_HTML_URLS[:1]:
         try:
             r = await c.get(url)
             r.raise_for_status()
@@ -405,7 +435,9 @@ async def _html_get_concurso(n: int) -> Optional[Dict[str, Any]]:
             continue
     return None
 
-# ---------------- Resolver com 3 níveis ----------------
+# ----------------------------------------------------------------------
+# Resolver de dados (3 níveis) + coleta
+# ----------------------------------------------------------------------
 
 
 async def _get_latest() -> Dict[str, Any]:
@@ -467,10 +499,6 @@ async def _get_concurso(n: int) -> Optional[Dict[str, Any]]:
 
     return None
 
-# ------------------------------------------------------------------------------
-# Coleta em lote
-# ------------------------------------------------------------------------------
-
 
 async def collect_last_n(limit: int) -> List[dict]:
     latest = await _get_latest()
@@ -497,7 +525,7 @@ async def collect_by_date(start: Optional[dt.date], end: Optional[dt.date], max_
     n = last_n
     while n >= 1 and fetched < max_fetch:
         d = await _get_concurso(n)
-        fetched += 1
+        fetched += 1        # cada request conta
         n -= 1
         if not d:
             continue
@@ -515,9 +543,9 @@ async def collect_by_date(start: Optional[dt.date], end: Optional[dt.date], max_
     results.sort(key=lambda x: int(x["contest"]), reverse=True)
     return results
 
-# ------------------------------------------------------------------------------
+# ----------------------------------------------------------------------
 # Endpoints
-# ------------------------------------------------------------------------------
+# ----------------------------------------------------------------------
 
 
 @app.get("/", response_class=JSONResponse)
@@ -575,7 +603,10 @@ async def lotofacil(limit: int = Query(10, ge=1, le=200), force: bool = False):
 
 
 @app.get("/stats", response_class=JSONResponse)
-async def stats(limit: int = Query(60, ge=1, le=200), hi: int = Query(12, ge=0, le=15), lo: int = Query(3, ge=0, le=15), force: bool = False):
+async def stats(limit: int = Query(60, ge=1, le=200),
+                hi: int = Query(12, ge=0, le=15),
+                lo: int = Query(3, ge=0, le=15),
+                force: bool = False):
     hi = max(0, min(15, hi))
     lo = max(0, min(15-hi, lo))
     if hi + lo != 15:
@@ -666,50 +697,50 @@ async def parity(
     payload["cache_age_seconds"] = 0
     return payload
 
-# ------------------------------------------------------------------------------
-# UI simples
-# ------------------------------------------------------------------------------
+# ----------------------------------------------------------------------
+# UI (com spinner, PT-BR, manifest e SW)
+# ----------------------------------------------------------------------
 
 
 @app.get("/app", response_class=HTMLResponse)
 async def ui():
-    html = """<!doctype html>
+    html = """
+<!doctype html>
 <html lang="pt-br">
 <head>
 <meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>Lotofácil</title>
-<style>
-:root { color-scheme: dark; }
-body { background:#0f172a; color:#e2e8f0; font-family: ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto; }
-.wrap { max-width:1024px; margin:24px auto; padding:0 16px; }
-.card { background:#0b1220; border:1px solid #1e293b; border-radius:12px; padding:16px; margin:16px 0; }
-.title { font-weight:700; font-size:18px; margin-bottom:8px; }
-.row { display:flex; gap:12px; align-items:center; flex-wrap:wrap; }
-input,select,button { background:#0b1220; color:#e2e8f0; border:1px solid #1e293b; border-radius:10px; padding:10px 12px; }
-button { cursor:pointer; }
-.badge { font-size:11px; background:#0b1220; border:1px solid #334155; border-radius:999px; padding:6px 10px; display:inline-flex; gap:8px; align-items:center; margin-right:10px; }
-.pill { border-radius:999px; padding:10px 14px; border:1px solid #1e293b; display:inline-flex; gap:8px; align-items:center; }
-.ball { width:60px; height:60px; border-radius:999px; display:flex; align-items:center; justify-content:center; font-weight:700; font-size:18px; margin:8px; }
-.ball.g { background:#16a34a22; border:1px solid #16a34a; color:#d1fae5; }
-.ball.r { background:#ef444422; border:1px solid #ef4444; color:#fee2e2; }
-table { width:100%; border-collapse:collapse; }
-th,td { padding:10px; border-top:1px solid #1e293b; text-align:left; }
-canvas { width:100%; height:260px; }
-.muted { color:#94a3b8; font-size:12px; }
+<link rel="manifest" href="/static/manifest.webmanifest" type="application/manifest+json">
+<link rel="apple-touch-icon" href="/static/apple-touch-icon.png">
+<link rel="icon" href="/static/favicon.ico">
+<meta name="theme-color" content="#0f172a">
 
-/* botão com spinner */
-.btn { position:relative; display:inline-flex; align-items:center; gap:10px; }
-.spin {
-  width:14px; height:14px; border:2px solid #94a3b8; border-top-color:#e2e8f0;
-  border-radius:999px; animation:spin 0.8s linear infinite;
-}
-.hidden { display:none; }
-@keyframes spin { to { transform:rotate(360deg); } }
+<style>
+:root{ color-scheme:dark; }
+body{ background:#0f172a; color:#e2e8f0; font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto; }
+.wrap{ max-width:1024px; margin:24px auto; padding:0 16px; }
+.card{ background:#0b1220; border:1px solid #1e293b; border-radius:12px; padding:16px; margin:16px 0; }
+.title{ font-weight:700; font-size:18px; margin-bottom:8px; }
+.row{ display:flex; gap:12px; align-items:center; flex-wrap:wrap; }
+input,select,button{ background:#0b1220; color:#e2e8f0; border:1px solid #1e293b; border-radius:10px; padding:10px 12px; }
+button{ cursor:pointer; }
+.pill{ border-radius:999px; padding:10px 14px; border:1px solid #1e293b; }
+.ball{ width:60px; height:60px; border-radius:999px; display:flex; align-items:center; justify-content:center; font-weight:700; font-size:18px; margin:8px; }
+.ball.g{ background:#16a34a22; border:1px solid #16a34a; color:#d1fae5; }
+.ball.r{ background:#ef444422; border:1px solid #ef4444; color:#fee2e2; }
+table{ width:100%; border-collapse:collapse; }
+th,td{ padding:10px; border-top:1px solid #1e293b; text-align:left; }
+canvas{ width:100%; height:260px; }
+.muted{ color:#94a3b8; font-size:12px; }
+.spin{ width:16px; height:16px; border:2px solid #94a3b8; border-top-color:transparent; border-radius:999px; display:inline-block; animation:spin .8s linear infinite; margin-right:8px; vertical-align:-3px; }
+.hidden{ display:none; }
+@keyframes spin{ to{ transform:rotate(360deg) } }
 </style>
+
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 </head>
 <body>
+
 <div class="wrap">
   <h2>Lotofácil</h2>
 
@@ -717,12 +748,26 @@ canvas { width:100%; height:260px; }
     <div class="row">
       <div>Janela</div>
       <select id="selWindow"></select>
+      <script>
+      (function(){
+        const sel = document.getElementById('selWindow');
+        for(let m=1;m<=12;m++){
+          const o=document.createElement('option');
+          o.value=`${m}m`; o.textContent=m===1?'1 mês':`${m} meses`;
+          if(m===3) o.selected=true;
+          sel.appendChild(o);
+        }
+        const all=document.createElement('option'); all.value='all'; all.textContent='Tudo'; sel.appendChild(all);
+      })();
+      </script>
 
       <div>Custom:</div>
       <input id="inpStart" type="date" />
-      <input id="inpEnd"   type="date"  />
+      <input id="inpEnd"   type="date" />
       <div>Pares</div><input id="inpEven" type="number" value="8" min="0" max="15" />
-      <div>Ímpares</div><input id="inpOdd"  type="number" value="7" min="0" max="15" />
+      <div>Ímpares</div><input id="inpOdd" type="number" value="7" min="0" max="15" />
+
+      <!-- Botão Atualizar com spinner -->
       <button id="btnRefresh" class="btn" type="button" onclick="loadAll(true)">
         <span id="spin" class="spin hidden" aria-hidden="true"></span>
         <span id="btnText">Atualizar</span>
@@ -730,10 +775,10 @@ canvas { width:100%; height:260px; }
     </div>
 
     <div class="row" style="margin-top:10px">
-      <span class="badge"><b>Atualizado</b> <span id="bdupdated">–</span></span>
-      <span class="badge"><b>Janela</b>     <span id="bdwindow">–</span></span>
-      <span class="badge"><b>Jogos</b>      <span id="bdgames">–</span></span>
-      <span class="badge"><b>Concurso mais atual</b> <span id="bdlatest">–</span></span>
+      <span class="badge"><b>Atualizado</b> <span id="bdupdated">—</span></span>
+      <span class="badge"><b>Janela</b> <span id="bdwindow">—</span></span>
+      <span class="badge"><b>Jogos</b> <span id="bdgames">—</span></span>
+      <span class="badge"><b>Concurso mais atual</b> <span id="bdlatest">—</span></span>
     </div>
   </div>
 
@@ -755,120 +800,90 @@ canvas { width:100%; height:260px; }
 </div>
 
 <script>
-// Helpers de data em PT-BR
-function fmtBRfromISO(iso){
-  if(!iso) return '—';
-  try{ const [y,m,d] = iso.split('-'); return `${d}-${m}-${y}`; }catch(e){ return iso; }
-}
-function parseBRDateTime(s){
-  if(!s) return null;
-  const [d, t='00:00:00'] = s.split(' ');
-  const [dd, mm, yy] = d.split('/').map(Number);
-  const [hh, mi, ss] = t.split(':').map(Number);
-  return new Date(yy, (mm-1), dd, hh, mi, ss || 0);
+function pad2(n){ return String(n).padStart(2,'0'); }
+function formatBrDateTime(s){
+  if(!s) return '';
+  try{
+    const [d, t='00:00:00'] = s.split(' ');
+    const [dd, mm, yy] = d.split('/').map(Number);
+    const [hh, mi, ss] = t.split(':').map(Number);
+    return new Date(yy, (mm-1), dd, hh, mi, (ss||0));
+  }catch(e){ return null; }
 }
 function agoBR(s){
-  const dt = parseBRDateTime(s);
+  const dt = formatBrDateTime(s);
   if(!dt) return '';
-  const diff = Math.max(0, (Date.now() - dt.getTime())/1000);
+  const diff = Math.max(0, (Date.now()-dt.getTime())/1000);
   if(diff < 60){ const v = Math.round(diff); return `há ${v} segundo${v!==1?'s':''}`; }
   if(diff < 3600){ const v = Math.round(diff/60); return `há ${v} minuto${v!==1?'s':''}`; }
   const v = Math.round(diff/3600); return `há ${v} hora${v!==1?'s':''}`;
 }
+function ball(n){ const c=(n%2===0)?'g':'r'; return `<div class="ball ${c}">${pad2(n)}</div>`; }
+let freqChart=null;
+async function j(url){ const r=await fetch(url); if(!r.ok) throw new Error('HTTP '+r.status); return r.json(); }
 
-// UI loading
-function setLoading(on){
-  const b = document.getElementById('btnRefresh');
-  const sp= document.getElementById('spin');
-  const tx= document.getElementById('btnText');
-  if(on){ sp.classList.remove('hidden'); tx.textContent='Atualizando…'; b.disabled=true; }
-  else { sp.classList.add('hidden');    tx.textContent='Atualizar';     b.disabled=false; }
-}
-
-let freqChart = null;
-
-async function loadAll(manual=false){
-  setLoading(true);
+async function loadAll(force=false){
+  const spin = document.getElementById('spin');
+  const btnText = document.getElementById('btnText');
+  spin.classList.remove('hidden'); btnText.textContent='Atualizando...';
   try{
-    const w     = document.getElementById('selWindow').value;
-    const start = document.getElementById('inpStart').value;
-    const end   = document.getElementById('inpEnd').value;
-    const E     = document.getElementById('inpEven').value || 8;
-    const O     = document.getElementById('inpOdd').value  || 7;
+    const w=document.getElementById('selWindow').value;
+    const start=document.getElementById('inpStart').value;
+    const end=document.getElementById('inpEnd').value;
+    const E=document.getElementById('inpEven').value||8;
+    const O=document.getElementById('inpOdd').value||7;
 
-    const force = manual ? '&force=true' : '';
-    let url = `/parity?window=${w}&even=${E}&odd=${O}${force}`;
-    if(start || end){
-      url = `/parity?even=${E}&odd=${O}${start?`&start=${start}`:''}${end?`&end=${end}`:''}${force}`;
-    }
+    let url=`/parity?window=${w}&even=${E}&odd=${O}${force?'&force=true':''}`;
+    if(start||end) url=`/parity?even=${E}&odd=${O}${start?`&start=${start}`:''}${end?`&end=${end}`:''}${force?'&force=true':''}`;
 
-    const [p, rdy] = await Promise.all([
-      fetch(url).then(r=>r.json()),
-      fetch('/ready').then(r=>r.json())
-    ]);
+    const [p,rdy] = await Promise.all([ j(url), j('/ready') ]);
+    const latest = rdy?.latest_contest ?? '—';
 
-    // badges
-    const updated = p.updated_at || '';
-    document.getElementById('bdupdated').innerText =
-      `${updated}${updated?(' · '+agoBR(updated)) : ''}`;
-    document.getElementById('bdwindow').innerText =
-      `${fmtBRfromISO(p.start||'')} → ${fmtBRfromISO(p.end||'')}`;
-    document.getElementById('bdgames').innerText  = p.considered_games ?? '0';
-    document.getElementById('bdlatest').innerText = rdy?.latest_contest ?? '—';
+    const updated = p.updated_at || '—';
+    const ago = updated ? ' · '+agoBR(updated) : '';
+    document.getElementById('bdupdated').innerText = `${updated}${ago}`;
+    document.getElementById('bdwindow').innerText  = `${p.start||'—'} → ${p.end||'—'}`;
+    document.getElementById('bdgames').innerText   = p.considered_games ?? '—';
+    document.getElementById('bdlatest').innerText  = latest;
 
-    // sugestão
-    const s = p.suggestion;
+    const s=p.suggestion;
     document.getElementById('pillParidade').innerText = s.pattern+' (pares/ímpares)';
-    document.getElementById('suggBalls').innerHTML   = s.combo
-      .map(n => `<div class="ball ${(n%2===0)?'g':'r'}">${String(n).padStart(2,'0')}</div>`)
-      .join('');
+    document.getElementById('suggBalls').innerHTML = s.combo.map(ball).join('');
 
-    // gráfico
-    const labels = p.frequencies.map(x => String(x.n).padStart(2,'0'));
-    const data   = p.frequencies.map(x => x.count);
+    const labels=p.frequencies.map(x=>pad2(x.n));
+    const data=p.frequencies.map(x=>x.count);
     if(freqChart) freqChart.destroy();
-    freqChart = new Chart(document.getElementById('chartFreq'), {
-      type:'bar',
-      data:{ labels, datasets:[{ label:'Frequência', data }] },
-      options:{ responsive:true, plugins:{ legend:{ display:false } } }
+    freqChart=new Chart(document.getElementById('chartFreq'), {
+      type:'bar', data:{labels, datasets:[{label:'Frequência', data}]},
+      options:{responsive:true, plugins:{legend:{display:false}}}
     });
 
-    // tabela
-    const lotos = await fetch('/lotofacil?limit=10').then(r=>r.json());
-    const tb = document.querySelector('#tbl tbody'); tb.innerHTML='';
-    for(const r of lotos.results || []){
-      const pad = `${r.even_count}-${r.odd_count}`;
-      const nums= r.numbers.map(n=>String(n).padStart(2,'0')).join(' ');
-      tb.insertAdjacentHTML('beforeend',
-        `<tr><td>${r.contest}</td><td>${r.date||''}</td><td>${nums}</td><td>${pad}</td></tr>`);
+    const lotos=await j('/lotofacil?limit=10');
+    const tb=document.querySelector('#tbl tbody'); tb.innerHTML='';
+    for(const r of lotos.results){
+      const pad=`${r.even_count}-${r.odd_count}`;
+      const nums=r.numbers.map(pad2).join(' ');
+      tb.insertAdjacentHTML('beforeend', `<tr><td>${r.contest}</td><td>${r.date||''}</td><td>${nums}</td><td>${pad}</td></tr>`);
     }
-  }catch(e){
-    console.error(e);
-    alert('Falha ao atualizar. Tente novamente.');
-  }finally{
-    setLoading(false);
+  } finally {
+    spin.classList.add('hidden'); btnText.textContent='Atualizar';
   }
 }
-
-// popula seletor e faz a 1ª carga
-(function(){
-  const sel = document.getElementById('selWindow');
-  for(let m=1; m<=12; m++){
-    const o = document.createElement('option');
-    o.value = `${m}m`;
-    o.textContent = m===1 ? '1 mês' : `${m} meses`;
-    if(m===3) o.selected = true;
-    sel.appendChild(o);
-  }
-  const all = document.createElement('option'); all.value='all'; all.textContent='Tudo';
-  sel.appendChild(all);
-  loadAll(false);
-})();
+loadAll(false);
 </script>
-</body></html>"""
-    # injeta apenas a versão, sem usar f-string
+
+<script>
+if('serviceWorker' in navigator){
+  navigator.serviceWorker.register('/static/sw.js').catch(()=>{});
+}
+</script>
+
+</body>
+</html>
+"""
     return HTMLResponse(html.replace("{APP_VERSION}", APP_VERSION))
 
 
 @app.on_event("shutdown")
-async def _shutdown(): await close_http()
+async def _shutdown():
+    await close_http()
