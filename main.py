@@ -842,7 +842,9 @@ async function loadAll(force=false){
     const updated = p.updated_at || '—';
     const ago = updated ? ' · '+agoBR(updated) : '';
     document.getElementById('bdupdated').innerText = `${updated}${ago}`;
-    document.getElementById('bdwindow').innerText  = `${p.start||'—'} → ${p.end||'—'}`;
+    const _wStart = p.start ? formatBRDate(p.start) : '—';
+    const _wEnd   = p.end   ? formatBRDate(p.end)   : '—';
+    document.getElementById('bdwindow').innerText = `${_wStart} → ${_wEnd}`;    
     document.getElementById('bdgames').innerText   = p.considered_games ?? '—';
     document.getElementById('bdlatest').innerText  = latest;
 
@@ -874,7 +876,7 @@ loadAll(false);
 
 <script>
 if('serviceWorker' in navigator){
-  navigator.serviceWorker.register('/static/sw.js').catch(()=>{});
+   navigator.serviceWorker.register('/static/sw.js?v=2').catch(()=>{});
 }
 </script>
 
