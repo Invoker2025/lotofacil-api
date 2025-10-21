@@ -710,7 +710,7 @@ async def ui():
 <head>
 <meta charset="utf-8" />
 <title>Lotofácil</title>
-<link rel="manifest" href="/static/manifest.webmanifest?v=2" type="application/manifest+json">
+<link rel="manifest" href="/static/manifest.webmanifest?v=3" type="application/manifest+json">
 <link rel="apple-touch-icon" href="/static/apple-touch-icon.png">
 <link rel="icon" href="/static/favicon.ico">
 <meta name="theme-color" content="#0f172a">
@@ -876,7 +876,7 @@ loadAll(false);
 
 <script>
 if('serviceWorker' in navigator){
-   navigator.serviceWorker.register('/static/sw.js?v=2').catch(()=>{});
+   navigator.serviceWorker.register('/static/sw.js?v=3').catch(()=>{});
 }
 </script>
 
