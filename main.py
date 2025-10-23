@@ -96,6 +96,9 @@ _http: httpx.AsyncClient | None = None
 _caixa_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
 _agg_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
 
+# >>>>>>>>>>>> NOVO: timezone BRT (UTC-3) para carimbar updated_at <<<<<<<<<<<<
+BRT = dt.timezone(dt.timedelta(hours=-3), name="BRT")
+
 
 async def ensure_http() -> httpx.AsyncClient:
     global _http
@@ -641,7 +644,8 @@ async def stats(limit: int = Query(60, ge=1, le=200),
         },
         "parity_pattern_example": sugg["pattern"],
         "method": "mixed",
-        "updated_at": dt.datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
+        # >>>>>>>>>>>> ALTERADO: carimbo em BRT <<<<<<<<<<<<
+        "updated_at": dt.datetime.now(BRT).strftime("%d/%m/%Y %H:%M:%S"),
         "source_url": "caixa|mirror|html",
         "cache_age_seconds": None,
     }
@@ -688,7 +692,8 @@ async def parity(
         "suggestion": sugg,
         "pattern": sugg["pattern"],
         "method": "mixed",
-        "updated_at": dt.datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
+        # >>>>>>>>>>>> ALTERADO: carimbo em BRT <<<<<<<<<<<<
+        "updated_at": dt.datetime.now(BRT).strftime("%d/%m/%Y %H:%M:%S"),
         "source_url": "caixa|mirror|html",
         "cache_age_seconds": None,
     }
