@@ -229,22 +229,118 @@ def frequencies(draws: List[dict]) -> List[Dict[str, Any]]:
     return [{"n": n, "count": counts[n], "pct": round((counts[n]/total)*100.0, 1)} for n in range(1, 26)]
 
 
-def build_parity_suggestion(draws: List[dict], even_needed: int = 8, odd_needed: int = 7) -> Dict[str, Any]:
+def classify_trend(draws: List[dict], window: int = 20):
+    recent = draws[:window]
+
+    counts = {n: 0 for n in range(1, 26)}
+    for d in recent:
+        for n in d["numbers"]:
+            counts[n] += 1
+
+    hot = [n for n, c in counts.items() if c >= 3]
+    warm = [n for n, c in counts.items() if 1 <= c <= 2]
+    cold = [n for n, c in counts.items() if c == 0]
+
+    return {
+        "hot": sorted(hot),
+        "warm": sorted(warm),
+        "cold": sorted(cold),
+        "counts": counts
+    }
+
+
+def build_parity_suggestion(
+    draws: List[dict],
+    even_needed: int = 8,
+    odd_needed: int = 7
+) -> Dict[str, Any]:
+
+    # ======================================================
+    # DEBUG / CONFIRMAÇÃO DE EXECUÇÃO
+    # ======================================================
+    print(">>> BUILD_PARITY_SUGGESTION (LIVRO NEGRO) EM EXECUÇÃO <<<")
+
+    # ------------------------------------------------------
+    # Segurança básica de parâmetros
+    # ------------------------------------------------------
     even_needed = max(0, min(15, even_needed))
-    odd_needed = max(0, min(15-even_needed, odd_needed))
+    odd_needed = max(0, min(15 - even_needed, odd_needed))
     if even_needed + odd_needed != 15:
         even_needed, odd_needed = 8, 7
-    freq = frequencies(draws)
-    ev = sorted([f for f in freq if f["n"] % 2 == 0],
-                key=lambda x: (-x["count"], x["n"]))[:even_needed]
-    od = sorted([f for f in freq if f["n"] % 2 == 1],
-                key=lambda x: (-x["count"], x["n"]))[:odd_needed]
+
+    # ------------------------------------------------------
+    # Último concurso (regra das repetidas)
+    # ------------------------------------------------------
+    last_draw = draws[0]["numbers"] if draws else []
+    print(f"[DEBUG] Último concurso: {last_draw}")
+
+    # ------------------------------------------------------
+    # TENDÊNCIA — Livro Negro (janela fixa = 20)
+    # ------------------------------------------------------
+    trend = classify_trend(draws, window=20)
+
+    hot = trend.get("hot", [])
+    warm = trend.get("warm", [])
+    cold = trend.get("cold", [])
+
+    print(f"[DEBUG] Quentes: {hot}")
+    print(f"[DEBUG] Mornas : {warm}")
+    print(f"[DEBUG] Frias  : {cold}")
+
+    allowed = set(hot + warm)   # frias ficam FORA
+
+    # ------------------------------------------------------
+    # Frequência apenas das dezenas permitidas
+    # ------------------------------------------------------
+    freq_all = frequencies(draws)
+    freq = [f for f in freq_all if f["n"] in allowed]
+
+    print(f"[DEBUG] Dezenas permitidas: {sorted(allowed)}")
+
+    # ------------------------------------------------------
+    # Seleção por paridade (8 pares / 7 ímpares)
+    # ------------------------------------------------------
+    ev = sorted(
+        [f for f in freq if f["n"] % 2 == 0],
+        key=lambda x: (-x["count"], x["n"])
+    )[:even_needed]
+
+    od = sorted(
+        [f for f in freq if f["n"] % 2 == 1],
+        key=lambda x: (-x["count"], x["n"])
+    )[:odd_needed]
+
     combo = sorted([x["n"] for x in ev] + [x["n"] for x in od])
+
+    print(f"[DEBUG] Combo gerado (antes das regras finais): {combo}")
+
+    # ======================================================
+    # REGRA DO LIVRO NEGRO — VALIDAÇÃO FINAL DO COMBO
+    # ======================================================
+
+    # regra da soma (190–210)
+    if not valid_sum(combo):
+        combo = []
+        ev = []
+        od = []
+
+    # regra das repetidas (máx 9)
+    elif not limit_repetition(combo, last_draw, max_repeat=9):
+        combo = []
+        ev = []
+        od = []
+
+    # ------------------------------------------------------
+    # Retorno final
+    # ------------------------------------------------------
     return {
         "even": [x["n"] for x in ev],
         "odd":  [x["n"] for x in od],
         "combo": combo,
-        "parity": {"even_count": even_needed, "odd_count": odd_needed},
+        "parity": {
+            "even_count": even_needed,
+            "odd_count": odd_needed
+        },
         "pattern": f"{even_needed}-{odd_needed}",
     }
 
@@ -298,6 +394,16 @@ def _normalize_from_any(j: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         }
     except Exception:
         return None
+
+
+def limit_repetition(candidate: List[int], last_draw: List[int], max_repeat: int = 9) -> bool:
+    repeated = len(set(candidate) & set(last_draw))
+    return repeated <= max_repeat
+
+
+def valid_sum(numbers: List[int], min_sum: int = 190, max_sum: int = 210) -> bool:
+    total = sum(numbers)
+    return min_sum <= total <= max_sum
 
 
 async def _mirror_get_latest() -> Optional[Dict[str, Any]]:
@@ -624,34 +730,29 @@ async def stats(limit: int = Query(60, ge=1, le=200),
 
     draws = await collect_last_n(limit)
     freqs = frequencies(draws)
+
+    # sugestão oficial (Livro Negro)
     sugg = build_parity_suggestion(draws, 8, 7)
+
     payload = {
         "ok": True,
         "considered_games": len(draws),
         "limit": limit,
-        "hi": hi, "lo": lo,
+        "hi": hi,
+        "lo": lo,
         "frequencies": freqs,
-        "suggestion": {
-            "hi": [x["n"] for x in sorted(freqs, key=lambda x: (-x["count"], x["n"]))[:hi]],
-            "lo": [x["n"] for x in sorted(freqs, key=lambda x: (x["count"], x["n"]))[:lo]],
-            "combo": sorted(
-                [x["n"]
-                    for x in sorted(freqs, key=lambda x: (-x["count"], x["n"]))[:hi]]
-                + [x["n"]
-                    for x in sorted(freqs, key=lambda x: (x["count"], x["n"]))[:lo]]
-            ),
-            "pattern": "n/a",
-        },
+
+        # >>>>> AQUI ESTÁ A CORREÇÃO <<<<<
+        "suggestion": sugg,
+
         "parity_pattern_example": sugg["pattern"],
         "method": "mixed",
-        # >>>>>>>>>>>> ALTERADO: carimbo em BRT <<<<<<<<<<<<
+
+        # >>>>>>>>>>>> carimbo em BRT <<<<<<<<<<<<
         "updated_at": dt.datetime.now(BRT).strftime("%d/%m/%Y %H:%M:%S"),
         "source_url": "caixa|mirror|html",
         "cache_age_seconds": None,
     }
-    _agg_put(payload, "stats", limit=limit, hi=hi, lo=lo)
-    payload["cache_age_seconds"] = 0
-    return payload
 
 
 @app.get("/parity", response_class=JSONResponse)
@@ -678,7 +779,24 @@ async def parity(
         sd, ed = window_to_range(window)
 
     draws = await collect_by_date(sd, ed, max_fetch=400)
+    last_draw = draws[0]["numbers"] if draws else []
+
     sugg = build_parity_suggestion(draws, even_needed=even, odd_needed=odd)
+
+    # >>> REGRA DO LIVRO NEGRO (OBRIGATÓRIA) <<<
+    if not valid_sum(sugg["combo"]) or not limit_repetition(
+        sugg["combo"], last_draw, max_repeat=0
+    ):
+        # descarta a combinação inválida
+        sugg["combo"] = []
+
+    # valida regras do Livro
+    if not valid_sum(sugg["combo"]):
+        sugg["combo"] = []
+
+    elif not limit_repetition(sugg["combo"], last_draw):
+        sugg["combo"] = []
+
     freqs = frequencies(draws)
 
     payload = {
@@ -899,6 +1017,79 @@ if('serviceWorker' in navigator){
 </html>
 """
     return HTMLResponse(html.replace("{APP_VERSION}", APP_VERSION))
+
+
+@app.get("/simulate", response_class=JSONResponse)
+async def simulate(
+    contest: int = Query(..., ge=1),
+    window: str = "3m"
+):
+    """
+    Simulação histórica:
+    - Gera a combinação que teria sido sugerida ATÉ a data do concurso informado
+    - Compara com o resultado real
+    """
+
+    # --------------------------------------------------
+    # 1. Buscar o concurso alvo
+    # --------------------------------------------------
+    all_draws = await collect_last_n(500)  # margem grande de segurança
+
+    target = next((d for d in all_draws if d["contest"] == contest), None)
+    if not target:
+        return JSONResponse(
+            status_code=404,
+            content={"ok": False, "error": "Concurso não encontrado"}
+        )
+
+    target_date = target["date"]
+    target_numbers = target["numbers"]
+
+    # --------------------------------------------------
+    # 2. Histórico SOMENTE ANTES do concurso alvo
+    # --------------------------------------------------
+    past_draws = [
+        d for d in all_draws
+        if d["date"] < target_date
+    ]
+
+    if len(past_draws) < 20:
+        return JSONResponse(
+            status_code=400,
+            content={"ok": False, "error": "Histórico insuficiente para simulação"}
+        )
+
+    # --------------------------------------------------
+    # 3. Gerar sugestão COMO SE FOSSE NAQUELA DATA
+    # --------------------------------------------------
+    sugg = build_parity_suggestion(
+        past_draws,
+        even_needed=8,
+        odd_needed=7
+    )
+
+    combo = sugg.get("combo", [])
+
+    # --------------------------------------------------
+    # 4. Comparação (acertos)
+    # --------------------------------------------------
+    hits = sorted(set(combo) & set(target_numbers))
+
+    # --------------------------------------------------
+    # 5. Retorno
+    # --------------------------------------------------
+    return {
+        "ok": True,
+        "contest": contest,
+        "date": target_date,
+        "suggested_at_time": combo,
+        "official_result": target_numbers,
+        "hits": hits,
+        "hits_count": len(hits),
+        "pattern": sugg.get("pattern"),
+        "method": "historical_simulation",
+        "updated_at": dt.datetime.now(BRT).strftime("%d/%m/%Y %H:%M:%S"),
+    }
 
 
 @app.on_event("shutdown")
