@@ -1,13 +1,5 @@
-# Lotofacil API – v6.5.1
-# - Coleta resultados da Lotofácil com 3 níveis:
-#     1) Mirror público (opcionalmente preferido)
-#     2) JSON oficial (Portal de Loterias CAIXA)
-#     3) HTML oficial (página de resultados: scraping tolerante)
-# - UI simples em /app; /ready mostra latest_contest; ícones e PWA em /static.
-
 from __future__ import annotations
 import logging
-
 import os
 import re
 import json
@@ -15,12 +7,20 @@ import time
 import datetime as dt
 from typing import Any, Dict, List, Tuple, Optional
 from pathlib import Path
-
 import httpx
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
+print(">>> MAIN.PY NOVO COM /SIMULATE CARREGADO <<<")
+
+# Lotofacil API – v6.5.1
+# - Coleta resultados da Lotofácil com 3 níveis:
+#     1) Mirror público (opcionalmente preferido)
+#     2) JSON oficial (Portal de Loterias CAIXA)
+#     3) HTML oficial (página de resultados: scraping tolerante)
+# - UI simples em /app; /ready mostra latest_contest; ícones e PWA em /static.
+
 
 # ----------------------------------------------------------------------
 # Paths / versão
@@ -317,18 +317,14 @@ def build_parity_suggestion(
     # ======================================================
     # REGRA DO LIVRO NEGRO — VALIDAÇÃO FINAL DO COMBO
     # ======================================================
+    # ======================================================
+    # REGRA DO LIVRO NEGRO — VALIDAÇÃO (SEM BLOQUEIO)
+    # ======================================================
 
-    # regra da soma (190–210)
-    if not valid_sum(combo):
-        combo = []
-        ev = []
-        od = []
+    valid_sum_ok = valid_sum(combo)
+    valid_repeat_ok = limit_repetition(combo, last_draw, max_repeat=9)
 
-    # regra das repetidas (máx 9)
-    elif not limit_repetition(combo, last_draw, max_repeat=9):
-        combo = []
-        ev = []
-        od = []
+    valid = valid_sum_ok and valid_repeat_ok
 
     # ------------------------------------------------------
     # Retorno final
@@ -342,6 +338,13 @@ def build_parity_suggestion(
             "odd_count": odd_needed
         },
         "pattern": f"{even_needed}-{odd_needed}",
+
+        # >>> NOVO (NÃO REMOVE NADA ANTIGO) <<<
+        "valid": valid,
+        "rules": {
+            "sum_ok": valid_sum_ok,
+            "repeat_ok": valid_repeat_ok
+        }
     }
 
 
@@ -858,6 +861,10 @@ canvas{ width:100%; height:260px; }
 .spin{ width:16px; height:16px; border:2px solid #94a3b8; border-top-color:transparent; border-radius:999px; display:inline-block; animation:spin .8s linear infinite; margin-right:8px; vertical-align:-3px; }
 .hidden{ display:none; }
 @keyframes spin{ to{ transform:rotate(360deg) } }
+
+.status-ok{ color:#22c55e; font-weight:600; }
+.status-warn{ color:#facc15; font-weight:600; }
+.status-bad{ color:#ef4444; }
 </style>
 
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
@@ -867,56 +874,75 @@ canvas{ width:100%; height:260px; }
 <div class="wrap">
   <h2>Lotofácil</h2>
 
-  <div class="card">
-    <div class="row">
-      <div>Janela</div>
-      <select id="selWindow"></select>
-      <script>
-      (function(){
-        const sel = document.getElementById('selWindow');
-        for(let m=1;m<=12;m++){
-          const o=document.createElement('option');
-          o.value=`${m}m`; o.textContent=m===1?'1 mês':`${m} meses`;
-          if(m===3) o.selected=true;
-          sel.appendChild(o);
-        }
-        const all=document.createElement('option'); all.value='all'; all.textContent='Tudo'; sel.appendChild(all);
-      })();
-      </script>
-
-      <div>Custom:</div>
-      <input id="inpStart" type="date" />
-      <input id="inpEnd"   type="date" />
-      <div>Pares</div><input id="inpEven" type="number" value="8" min="0" max="15" />
-      <div>Ímpares</div><input id="inpOdd" type="number" value="7" min="0" max="15" />
-
-      <!-- Botão Atualizar com spinner -->
-      <button id="btnRefresh" class="btn" type="button" onclick="loadAll(true)">
-        <span id="spin" class="spin hidden" aria-hidden="true"></span>
-        <span id="btnText">Atualizar</span>
-      </button>
-    </div>
-
-    <div class="row" style="margin-top:10px">
-      <span class="badge"><b>Atualizado</b> <span id="bdupdated">—</span></span>
-      <span class="badge"><b>Janela</b> <span id="bdwindow">—</span></span>
-      <span class="badge"><b>Jogos</b> <span id="bdgames">—</span></span>
-      <span class="badge"><b>Concurso mais atual</b> <span id="bdlatest">—</span></span>
-    </div>
+  <div class="row" style="margin-bottom:16px;">
+    <button class="pill" onclick="showTab('main')">📊 Atual</button>
+    <button class="pill" onclick="showTab('sim')">🕰️ Simulação</button>
   </div>
 
-  <div class="card">
-    <div class="row" style="justify-content:space-between;">
-      <div class="title">Combinação sugerida <span class="pill" id="pillParidade">8-7 (pares/ímpares)</span></div>
+  <div id="tab-main">
+
+    <div class="card">
+      <div class="row">
+        <div>Janela</div>
+        <select id="selWindow"></select>
+        <script>
+        (function(){
+          const sel = document.getElementById('selWindow');
+          for(let m=1;m<=12;m++){
+            const o=document.createElement('option');
+            o.value=`${m}m`; o.textContent=m===1?'1 mês':`${m} meses`;
+            if(m===3) o.selected=true;
+            sel.appendChild(o);
+          }
+          const all=document.createElement('option'); all.value='all'; all.textContent='Tudo'; sel.appendChild(all);
+        })();
+        </script>
+
+        <div>Custom:</div>
+        <input id="inpStart" type="date" />
+        <input id="inpEnd" type="date" />
+        <div>Pares</div><input id="inpEven" type="number" value="8" />
+        <div>Ímpares</div><input id="inpOdd" type="number" value="7" />
+
+        <button onclick="loadAll(true)">
+          <span id="spin" class="spin hidden"></span>
+          <span id="btnText">Atualizar</span>
+        </button>
+      </div>
     </div>
-    <div id="suggBalls" class="row"></div>
+
+    <div class="card">
+      <div class="title">Combinação sugerida <span class="pill" id="pillParidade"></span></div>
+      <div id="suggBalls" class="row"></div>
+      <div id="suggStatus" class="muted"></div>
+    </div>
+
+    <div class="card">
+      <div class="title">Frequência</div>
+      <canvas id="chartFreq"></canvas>
+    </div>
+
   </div>
 
-  <div class="card"><div class="title">Frequência por dezena (na janela)</div><canvas id="chartFreq"></canvas></div>
+  <div id="tab-sim" class="hidden">
+    <div class="card">
+      <div class="title">Simulação histórica</div>
+      <div class="row">
+        <input id="inpContest" type="number" placeholder="Ex: 3583" />
+        <button onclick="loadSim()">Simular</button>
+      </div>
+    </div>
 
-  <div class="card">
-    <div class="title">Amostra (10 últimos)</div>
-    <table id="tbl"><thead><tr><th>Concurso</th><th>Data</th><th>Dezenas</th><th>Padrão</th></tr></thead><tbody></tbody></table>
+    <div class="card">
+      <div class="title">Sugestão da época</div>
+      <div id="simSuggested" class="row"></div>
+    </div>
+
+    <div class="card">
+      <div class="title">Resultado oficial</div>
+      <div id="simOfficial" class="row"></div>
+      <div id="simHits" class="muted"></div>
+    </div>
   </div>
 
   <div class="muted">Fonte: CAIXA · API pessoal · v{APP_VERSION}</div>
@@ -924,93 +950,35 @@ canvas{ width:100%; height:260px; }
 
 <script>
 function pad2(n){ return String(n).padStart(2,'0'); }
+function ball(n){ return `<div class="ball ${n%2===0?'g':'r'}">${pad2(n)}</div>`; }
 
-// >>> NOVO: converte 'aaaa-mm-dd' para 'dd-mm-aaaa' (padrão BR)
-function formatBRDate(iso){
-  if(!iso) return '';
-  try{
-    const [y,m,d] = iso.split('-').map(Number);
-    return `${pad2(d)}-${pad2(m)}-${y}`;
-  }catch(e){ return iso; }
+function showTab(t){
+  document.getElementById('tab-main').classList.toggle('hidden', t!=='main');
+  document.getElementById('tab-sim').classList.toggle('hidden', t!=='sim');
 }
 
-function formatBrDateTime(s){
-  if(!s) return '';
-  try{
-    const [d, t='00:00:00'] = s.split(' ');
-    const [dd, mm, yy] = d.split('/').map(Number);
-    const [hh, mi, ss] = t.split(':').map(Number);
-    return new Date(yy, (mm-1), dd, hh, mi, (ss||0));
-  }catch(e){ return null; }
+async function j(u){ const r=await fetch(u); return r.json(); }
+
+async function loadAll(){
+  const p=await j('/parity');
+  document.getElementById('pillParidade').innerText=p.suggestion.pattern;
+  document.getElementById('suggBalls').innerHTML=p.suggestion.combo.map(ball).join('');
+  const s=p.suggestion;
+  document.getElementById('suggStatus').innerHTML =
+    s.valid
+      ? '<span class="status-ok">✅ Jogo sugerido</span>'
+      : '<span class="status-warn">⚠️ Fora do critério</span>';
 }
-function agoBR(s){
-  const dt = formatBrDateTime(s);
-  if(!dt) return '';
-  const diff = Math.max(0, (Date.now()-dt.getTime())/1000);
-  if(diff < 60){ const v = Math.round(diff); return `há ${v} segundo${v!==1?'s':''}`; }
-  if(diff < 3600){ const v = Math.round(diff/60); return `há ${v} minuto${v!==1?'s':''}`; }
-  const v = Math.round(diff/3600); return `há ${v} hora${v!==1?'s':''}`;
+
+async function loadSim(){
+  const c=document.getElementById('inpContest').value;
+  const r=await j(`/simulate?contest=${c}`);
+  document.getElementById('simSuggested').innerHTML=r.suggested_at_time.map(ball).join('');
+  document.getElementById('simOfficial').innerHTML=r.official_result.map(ball).join('');
+  document.getElementById('simHits').innerHTML=`🎯 Acertos: ${r.hits_count}`;
 }
-function ball(n){ const c=(n%2===0)?'g':'r'; return `<div class="ball ${c}">${pad2(n)}</div>`; }
-let freqChart=null;
-async function j(url){ const r=await fetch(url); if(!r.ok) throw new Error('HTTP '+r.status); return r.json(); }
 
-async function loadAll(force=false){
-  const spin = document.getElementById('spin');
-  const btnText = document.getElementById('btnText');
-  spin.classList.remove('hidden'); btnText.textContent='Atualizando...';
-  try{
-    const w=document.getElementById('selWindow').value;
-    const start=document.getElementById('inpStart').value;
-    const end=document.getElementById('inpEnd').value;
-    const E=document.getElementById('inpEven').value||8;
-    const O=document.getElementById('inpOdd').value||7;
-
-    let url=`/parity?window=${w}&even=${E}&odd=${O}${force?'&force=true':''}`;
-    if(start||end) url=`/parity?even=${E}&odd=${O}${start?`&start=${start}`:''}${end?`&end=${end}`:''}${force?'&force=true':''}`;
-
-    const [p,rdy] = await Promise.all([ j(url), j('/ready') ]);
-    const latest = rdy?.latest_contest ?? '—';
-
-    const updated = p.updated_at || '—';
-    const ago = updated ? ' · '+agoBR(updated) : '';
-    document.getElementById('bdupdated').innerText = `${updated}${ago}`;
-    const _wStart = p.start ? formatBRDate(p.start) : '—';
-    const _wEnd   = p.end   ? formatBRDate(p.end)   : '—';
-    document.getElementById('bdwindow').innerText = `${_wStart} → ${_wEnd}`;    
-    document.getElementById('bdgames').innerText   = p.considered_games ?? '—';
-    document.getElementById('bdlatest').innerText  = latest;
-
-    const s=p.suggestion;
-    document.getElementById('pillParidade').innerText = s.pattern+' (pares/ímpares)';
-    document.getElementById('suggBalls').innerHTML = s.combo.map(ball).join('');
-
-    const labels=p.frequencies.map(x=>pad2(x.n));
-    const data=p.frequencies.map(x=>x.count);
-    if(freqChart) freqChart.destroy();
-    freqChart=new Chart(document.getElementById('chartFreq'), {
-      type:'bar', data:{labels, datasets:[{label:'Frequência', data}]},
-      options:{responsive:true, plugins:{legend:{display:false}}}
-    });
-
-    const lotos=await j('/lotofacil?limit=10');
-    const tb=document.querySelector('#tbl tbody'); tb.innerHTML='';
-    for(const r of lotos.results){
-      const pad=`${r.even_count}-${r.odd_count}`;
-      const nums=r.numbers.map(pad2).join(' ');
-      tb.insertAdjacentHTML('beforeend', `<tr><td>${r.contest}</td><td>${r.date||''}</td><td>${nums}</td><td>${pad}</td></tr>`);
-    }
-  } finally {
-    spin.classList.add('hidden'); btnText.textContent='Atualizar';
-  }
-}
-loadAll(false);
-</script>
-
-<script>
-if('serviceWorker' in navigator){
-   navigator.serviceWorker.register('/static/sw.js?v=3').catch(()=>{});
-}
+loadAll();
 </script>
 
 </body>
