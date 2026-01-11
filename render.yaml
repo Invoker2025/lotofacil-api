@@ -2,18 +2,16 @@ services:
   - type: web
     name: lotofacil-api
     env: python
-    plan: free
-    autoDeploy: true
-    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
-    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
-    healthCheckPath: /health
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port 10000
     envVars:
       - key: PYTHON_VERSION
-        value: 3.12.5
-      # Ajuste de caches (opcional)
-      - key: AGG_TTL_SEC
-        value: "600"
-      - key: CAIXA_TTL_SEC
-        value: "600"
+        value: 3.11.0
       - key: HTTP_TIMEOUT
-        value: "12"
+        value: 30
+      - key: AGG_TTL_SEC
+        value: 300
+      - key: CAIXA_TTL_SEC
+        value: 300
+      - key: PREFER_MIRROR
+        value: "1"  # Usar mirror primeiro para ser mais rápido

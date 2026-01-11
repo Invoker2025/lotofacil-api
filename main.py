@@ -5,6 +5,7 @@ import re
 import json
 import time
 import datetime as dt
+import asyncio  # Para a pausa na coleta
 from typing import Any, Dict, List, Tuple, Optional
 from pathlib import Path
 import httpx
@@ -29,6 +30,32 @@ BASE_DIR = Path(__file__).parent
 STATIC_DIR = (BASE_DIR / "static").resolve()
 APP_VERSION = "6.5.1"
 
+# ----------------------------------------------------------------------
+# Configuração de Logging
+# ----------------------------------------------------------------------
+# Configura logging detalhado
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+
+# Cria logger principal
+logger = logging.getLogger("lotofacil_api")
+logger.setLevel(logging.INFO)
+
+# Handler para console
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.INFO)
+formatter = logging.Formatter(
+    '%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+console_handler.setFormatter(formatter)
+logger.addHandler(console_handler)
+
+# Desativa logs do uvicorn se quiser menos ruído
+logging.getLogger("uvicorn").setLevel(logging.WARNING)
+logging.getLogger("uvicorn.error").setLevel(logging.WARNING)
+
+logger.info(f"🎯 Lotofacil API v{APP_VERSION} iniciando...")
 # ----------------------------------------------------------------------
 # App
 # ----------------------------------------------------------------------
@@ -230,22 +257,39 @@ def frequencies(draws: List[dict]) -> List[Dict[str, Any]]:
 
 
 def classify_trend(draws: List[dict], window: int = 20):
-    recent = draws[:window]
+    """Classifica dezenas em quentes, mornas e frias"""
+    if not draws or len(draws) < window:
+        window = len(draws)
+
+    draws_sorted = sorted(
+        draws,
+        key=lambda d: int(d["contest"]),
+        reverse=True
+    )
+    recent = draws_sorted[:window]
 
     counts = {n: 0 for n in range(1, 26)}
     for d in recent:
         for n in d["numbers"]:
             counts[n] += 1
 
-    hot = [n for n, c in counts.items() if c >= 3]
-    warm = [n for n, c in counts.items() if 1 <= c <= 2]
-    cold = [n for n, c in counts.items() if c == 0]
+    # AJUSTE OS LIMITES PARA SEREM MAIS RESTRITIVOS:
+    # Quentes: apareceram em 70%+ dos últimos concursos
+    # Mornas: apareceram em 30%-70%
+    # Frias: apareceram em menos de 30%
+
+    hot = [n for n, c in counts.items() if c >= int(window * 0.7)]  # 70%+
+    warm = [n for n, c in counts.items() if int(window * 0.3) <= c <
+            int(window * 0.7)]  # 30%-70%
+    cold = [n for n, c in counts.items() if c < int(window * 0.3)
+            ]  # menos de 30%
 
     return {
         "hot": sorted(hot),
         "warm": sorted(warm),
         "cold": sorted(cold),
-        "counts": counts
+        "counts": counts,
+        "window_used": window
     }
 
 
@@ -256,96 +300,161 @@ def build_parity_suggestion(
 ) -> Dict[str, Any]:
 
     # ======================================================
-    # DEBUG / CONFIRMAÇÃO DE EXECUÇÃO
+    # INÍCIO DO BLOCO DE TRATAMENTO DE ERROS
     # ======================================================
-    print(">>> BUILD_PARITY_SUGGESTION (LIVRO NEGRO) EM EXECUÇÃO <<<")
+    try:
+        logger.debug(
+            f"[LIVRO NEGRO] Iniciando sugestão com {len(draws)} concursos")
 
-    # ------------------------------------------------------
-    # Segurança básica de parâmetros
-    # ------------------------------------------------------
-    even_needed = max(0, min(15, even_needed))
-    odd_needed = max(0, min(15 - even_needed, odd_needed))
-    if even_needed + odd_needed != 15:
-        even_needed, odd_needed = 8, 7
+        # ------------------------------------------------------
+        # Validação básica de entrada
+        # ------------------------------------------------------
+        if not draws or len(draws) < 2:
+            logger.warning(
+                f"[LIVRO NEGRO] Draws insuficientes: {len(draws) if draws else 0}")
+            return {
+                "even": [],
+                "odd": [],
+                "combo": [],
+                "parity": {"even_count": even_needed, "odd_count": odd_needed},
+                "pattern": f"{even_needed}-{odd_needed}",
+                "valid": False,
+                "rules": {"sum_ok": False, "repeat_ok": False},
+                "error": "Draws insuficientes para análise"
+            }
 
-    # ------------------------------------------------------
-    # Último concurso (regra das repetidas)
-    # ------------------------------------------------------
-    last_draw = draws[0]["numbers"] if draws else []
-    print(f"[DEBUG] Último concurso: {last_draw}")
+        # ------------------------------------------------------
+        # DEBUG: Log dos primeiros concursos
+        # ------------------------------------------------------
+        if logger.isEnabledFor(logging.DEBUG):
+            sample = [f"{d.get('contest', '?')}" for d in draws[:3]]
+            logger.debug(
+                f"[LIVRO NEGRO] Primeiros concursos: {', '.join(sample)}")
+            logger.debug(
+                f"[LIVRO NEGRO] Config: {even_needed} pares, {odd_needed} ímpares")
 
-    # ------------------------------------------------------
-    # TENDÊNCIA — Livro Negro (janela fixa = 20)
-    # ------------------------------------------------------
-    trend = classify_trend(draws, window=20)
+        # ------------------------------------------------------
+        # Segurança básica de parâmetros
+        # ------------------------------------------------------
+        even_needed = max(0, min(15, even_needed))
+        odd_needed = max(0, min(15 - even_needed, odd_needed))
+        if even_needed + odd_needed != 15:
+            even_needed, odd_needed = 8, 7
+            logger.info(
+                f"[LIVRO NEGRO] Paridade ajustada para {even_needed}-{odd_needed}")
 
-    hot = trend.get("hot", [])
-    warm = trend.get("warm", [])
-    cold = trend.get("cold", [])
+        # ------------------------------------------------------
+        # Último concurso (regra das repetidas)
+        # ------------------------------------------------------
+        last_draw = draws[0]["numbers"] if draws else []
+        logger.debug(f"[LIVRO NEGRO] Último concurso: {sorted(last_draw)}")
 
-    print(f"[DEBUG] Quentes: {hot}")
-    print(f"[DEBUG] Mornas : {warm}")
-    print(f"[DEBUG] Frias  : {cold}")
+        # ------------------------------------------------------
+        # TENDÊNCIA — Livro Negro (janela fixa = 20)
+        # ------------------------------------------------------
+        trend = classify_trend(draws, window=20)
+        hot = trend.get("hot", [])
+        warm = trend.get("warm", [])
+        cold = trend.get("cold", [])
 
-    allowed = set(hot + warm)   # frias ficam FORA
+        logger.debug(f"[LIVRO NEGRO] Quentes: {sorted(hot)}")
+        logger.debug(f"[LIVRO NEGRO] Mornas : {sorted(warm)}")
+        logger.debug(f"[LIVRO NEGRO] Frias  : {sorted(cold)}")
 
-    # ------------------------------------------------------
-    # Frequência apenas das dezenas permitidas
-    # ------------------------------------------------------
-    freq_all = frequencies(draws)
-    freq = [f for f in freq_all if f["n"] in allowed]
+        allowed = set(hot + warm)   # frias ficam FORA
+        logger.debug(
+            f"[LIVRO NEGRO] Dezenas permitidas ({len(allowed)}): {sorted(allowed)}")
 
-    print(f"[DEBUG] Dezenas permitidas: {sorted(allowed)}")
+        # ------------------------------------------------------
+        # Frequência apenas das dezenas permitidas
+        # ------------------------------------------------------
+        freq_all = frequencies(draws)
+        freq = [f for f in freq_all if f["n"] in allowed]
 
-    # ------------------------------------------------------
-    # Seleção por paridade (8 pares / 7 ímpares)
-    # ------------------------------------------------------
-    ev = sorted(
-        [f for f in freq if f["n"] % 2 == 0],
-        key=lambda x: (-x["count"], x["n"])
-    )[:even_needed]
+        if not freq or len(freq) < 15:
+            logger.warning(
+                f"[LIVRO NEGRO] Frequência insuficiente: {len(freq)} dezenas")
+            # Fallback: usar todas as dezenas
+            freq = freq_all
 
-    od = sorted(
-        [f for f in freq if f["n"] % 2 == 1],
-        key=lambda x: (-x["count"], x["n"])
-    )[:odd_needed]
+        # ------------------------------------------------------
+        # Seleção por paridade (8 pares / 7 ímpares)
+        # ------------------------------------------------------
+        ev = sorted(
+            [f for f in freq if f["n"] % 2 == 0],
+            key=lambda x: (-x["count"], x["n"])
+        )[:even_needed]
 
-    combo = sorted([x["n"] for x in ev] + [x["n"] for x in od])
+        od = sorted(
+            [f for f in freq if f["n"] % 2 == 1],
+            key=lambda x: (-x["count"], x["n"])
+        )[:odd_needed]
 
-    print(f"[DEBUG] Combo gerado (antes das regras finais): {combo}")
+        # Verifica se temos números suficientes
+        if len(ev) < even_needed or len(od) < odd_needed:
+            logger.warning(
+                f"[LIVRO NEGRO] Seleção incompleta: {len(ev)} pares, {len(od)} ímpares")
+            # Preenche com as mais frequentes disponíveis
+            ev = sorted(freq_all, key=lambda x: (-x["count"], x["n"]))
+            ev = [f for f in ev if f["n"] % 2 == 0][:even_needed]
+            od = [f for f in ev if f["n"] % 2 == 1][:odd_needed]
 
-    # ======================================================
-    # REGRA DO LIVRO NEGRO — VALIDAÇÃO FINAL DO COMBO
-    # ======================================================
-    # ======================================================
-    # REGRA DO LIVRO NEGRO — VALIDAÇÃO (SEM BLOQUEIO)
-    # ======================================================
+        combo = sorted([x["n"] for x in ev] + [x["n"] for x in od])
 
-    valid_sum_ok = valid_sum(combo)
-    valid_repeat_ok = limit_repetition(combo, last_draw, max_repeat=9)
+        logger.debug(f"[LIVRO NEGRO] Combo gerado: {combo}")
 
-    valid = valid_sum_ok and valid_repeat_ok
+        # ======================================================
+        # REGRA DO LIVRO NEGRO — VALIDAÇÃO (SEM BLOQUEIO)
+        # ======================================================
 
-    # ------------------------------------------------------
-    # Retorno final
-    # ------------------------------------------------------
-    return {
-        "even": [x["n"] for x in ev],
-        "odd":  [x["n"] for x in od],
-        "combo": combo,
-        "parity": {
-            "even_count": even_needed,
-            "odd_count": odd_needed
-        },
-        "pattern": f"{even_needed}-{odd_needed}",
+        valid_sum_ok = valid_sum(combo)
+        valid_repeat_ok = limit_repetition(combo, last_draw, max_repeat=9)
+        valid = valid_sum_ok and valid_repeat_ok
 
-        # >>> NOVO (NÃO REMOVE NADA ANTIGO) <<<
-        "valid": valid,
-        "rules": {
-            "sum_ok": valid_sum_ok,
-            "repeat_ok": valid_repeat_ok
+        logger.debug(
+            f"[LIVRO NEGRO] Validações: sum_ok={valid_sum_ok}, repeat_ok={valid_repeat_ok}, valid={valid}")
+
+        # ------------------------------------------------------
+        # Retorno final
+        # ------------------------------------------------------
+        return {
+            "even": [x["n"] for x in ev],
+            "odd":  [x["n"] for x in od],
+            "combo": combo,
+            "parity": {
+                "even_count": even_needed,
+                "odd_count": odd_needed
+            },
+            "pattern": f"{even_needed}-{odd_needed}",
+            "valid": valid,
+            "rules": {
+                "sum_ok": valid_sum_ok,
+                "repeat_ok": valid_repeat_ok
+            },
+            "meta": {
+                "hot_count": len(hot),
+                "warm_count": len(warm),
+                "cold_count": len(cold),
+                "draws_analyzed": len(draws)
+            }
         }
-    }
+
+    except Exception as e:
+        logger.error(f"[LIVRO NEGRO] ERRO CRÍTICO: {str(e)}", exc_info=True)
+        return {
+            "even": [],
+            "odd": [],
+            "combo": [],
+            "parity": {"even_count": even_needed, "odd_count": odd_needed},
+            "pattern": f"{even_needed}-{odd_needed}",
+            "valid": False,
+            "rules": {"sum_ok": False, "repeat_ok": False},
+            "error": f"Erro interno: {str(e)}",
+            "meta": {"error": True}
+        }
+    # ======================================================
+    # FIM DO BLOCO DE TRATAMENTO DE ERROS
+    # ======================================================
 
 
 def window_to_range(window: str) -> Tuple[Optional[dt.date], Optional[dt.date]]:
@@ -613,47 +722,115 @@ async def _get_concurso(n: int) -> Optional[Dict[str, Any]]:
 
 
 async def collect_last_n(limit: int) -> List[dict]:
-    latest = await _get_latest()
-    last_n = int(latest.get("contest") or 0)
-    if last_n <= 0:
+    """Coleta os últimos N concursos com logging detalhado"""
+    logger.info(f"[COLETA] Iniciando coleta dos últimos {limit} concursos")
+
+    try:
+        latest = await _get_latest()
+        last_n = int(latest.get("contest") or 0)
+
+        if last_n <= 0:
+            logger.warning("[COLETA] Nenhum concurso encontrado")
+            return []
+
+        logger.info(f"[COLETA] Último concurso: {last_n}")
+
+        out: List[dict] = []
+        n = last_n
+        request_count = 0
+
+        while n >= 1 and len(out) < limit:
+            request_count += 1
+            if request_count % 10 == 0:
+                logger.debug(
+                    f"[COLETA] Progresso: {len(out)}/{limit} concursos")
+
+            d = await _get_concurso(n)
+            if d:
+                out.append(d)
+            else:
+                logger.warning(f"[COLETA] Concurso {n} não encontrado")
+
+            n -= 1
+
+            # Pausa para não sobrecarregar
+            if request_count % 20 == 0:
+                await asyncio.sleep(0.1)
+
+        logger.info(f"[COLETA] Coleta concluída: {len(out)} concursos obtidos")
+        logger.debug(
+            f"[COLETA] Concursos coletados: {[d['contest'] for d in out[:5]]}...")
+
+        return out[:limit]
+
+    except Exception as e:
+        logger.error(f"[COLETA] Erro na coleta: {str(e)}", exc_info=True)
         return []
-    out: List[dict] = []
-    n = last_n
-    while n >= 1 and len(out) < limit:
-        d = await _get_concurso(n)
-        if d:
-            out.append(d)
-        n -= 1
-    return out[:limit]
 
 
 async def collect_by_date(start: Optional[dt.date], end: Optional[dt.date], max_fetch: int = 400) -> List[dict]:
-    latest = await _get_latest()
-    last_n = int(latest.get("contest") or 0)
-    if last_n <= 0:
-        return []
-    results: List[dict] = []
-    fetched = 0
-    n = last_n
-    while n >= 1 and fetched < max_fetch:
-        d = await _get_concurso(n)
-        fetched += 1        # cada request conta
-        n -= 1
-        if not d:
-            continue
-        dd = parse_draw_date(d.get("date") or "")
-        if dd is None:
-            continue
-        if start and dd < start:
-            if results:
-                break
-            else:
+    """Coleta concursos por período com logging"""
+    logger.info(f"[COLETA-PERIODO] Coletando de {start} a {end}")
+
+    try:
+        latest = await _get_latest()
+        last_n = int(latest.get("contest") or 0)
+
+        if last_n <= 0:
+            logger.warning("[COLETA-PERIODO] Nenhum concurso base encontrado")
+            return []
+
+        results: List[dict] = []
+        fetched = 0
+        n = last_n
+
+        logger.debug(f"[COLETA-PERIODO] Iniciando do concurso {last_n}")
+
+        while n >= 1 and fetched < max_fetch:
+            fetched += 1
+
+            if fetched % 50 == 0:
+                logger.debug(
+                    f"[COLETA-PERIODO] {fetched} requests, {len(results)} concursos válidos")
+
+            d = await _get_concurso(n)
+            n -= 1
+
+            if not d:
                 continue
-        if end and dd > end:
-            continue
-        results.append(d)
-    results.sort(key=lambda x: int(x["contest"]), reverse=True)
-    return results
+
+            dd = parse_draw_date(d.get("date") or "")
+            if dd is None:
+                logger.debug(
+                    f"[COLETA-PERIODO] Data inválida no concurso {d.get('contest')}")
+                continue
+
+            if start and dd < start:
+                if results:
+                    logger.debug(
+                        f"[COLETA-PERIODO] Data {dd} antes do início {start}, parando")
+                    break
+                else:
+                    continue
+
+            if end and dd > end:
+                continue
+
+            results.append(d)
+
+            if len(results) % 10 == 0:
+                logger.debug(
+                    f"[COLETA-PERIODO] Adicionado concurso {d.get('contest')} - {dd}")
+
+        results.sort(key=lambda x: int(x["contest"]), reverse=True)
+        logger.info(
+            f"[COLETA-PERIODO] Concluído: {len(results)} concursos no período")
+
+        return results
+
+    except Exception as e:
+        logger.error(f"[COLETA-PERIODO] Erro: {str(e)}", exc_info=True)
+        return []
 
 # ----------------------------------------------------------------------
 # Endpoints
@@ -661,6 +838,7 @@ async def collect_by_date(start: Optional[dt.date], end: Optional[dt.date], max_
 
 
 @app.get("/", response_class=JSONResponse)
+@app.head("/")  # ⬅️ ADICIONE ESTA LINHA!
 async def root():
     return {
         "message": "Lotofacil API está online!",
@@ -672,6 +850,11 @@ async def root():
             "parity": "/parity?window=3m&even=8&odd=7",
         },
     }
+
+
+@app.head("/")
+async def root_head():
+    return {}
 
 
 @app.get("/health", response_class=JSONResponse)
@@ -757,6 +940,8 @@ async def stats(limit: int = Query(60, ge=1, le=200),
         "cache_age_seconds": None,
     }
 
+    return payload
+
 
 @app.get("/parity", response_class=JSONResponse)
 async def parity(
@@ -786,21 +971,7 @@ async def parity(
 
     sugg = build_parity_suggestion(draws, even_needed=even, odd_needed=odd)
 
-    # >>> REGRA DO LIVRO NEGRO (OBRIGATÓRIA) <<<
-    if not valid_sum(sugg["combo"]) or not limit_repetition(
-        sugg["combo"], last_draw, max_repeat=0
-    ):
-        # descarta a combinação inválida
-        sugg["combo"] = []
-
-    # valida regras do Livro
-    if not valid_sum(sugg["combo"]):
-        sugg["combo"] = []
-
-    elif not limit_repetition(sugg["combo"], last_draw):
-        sugg["combo"] = []
-
-    freqs = frequencies(draws)
+    freqs = frequencies(draws) if draws else frequencies(await collect_last_n(50))
 
     payload = {
         "ok": True,
@@ -829,7 +1000,9 @@ async def parity(
 
 
 @app.get("/app", response_class=HTMLResponse)
+@app.get("/app/", response_class=HTMLResponse)
 async def ui():
+
     html = """
 <!doctype html>
 <html lang="pt-br">
@@ -865,6 +1038,156 @@ canvas{ width:100%; height:260px; }
 .status-ok{ color:#22c55e; font-weight:600; }
 .status-warn{ color:#facc15; font-weight:600; }
 .status-bad{ color:#ef4444; }
+/* Estilo para bolas com acertos */
+.ball.hit {
+  animation: pulse 2s infinite;
+  font-weight: 900;
+}
+
+@keyframes pulse {
+  0% { transform: scale(1); box-shadow: 0 0 0 0 rgba(251, 191, 36, 0.7); }
+  70% { transform: scale(1.05); box-shadow: 0 0 0 10px rgba(251, 191, 36, 0); }
+  100% { transform: scale(1); box-shadow: 0 0 0 0 rgba(251, 191, 36, 0); }
+}
+
+/* Legenda */
+.legend {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 8px;
+  font-size: 12px;
+}
+
+.legend-item {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.legend-dot {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+}
+
+.legend-normal {
+  background: #16a34a22;
+  border: 1px solid #16a34a;
+}
+
+.legend-hit {
+  background: #15803d;
+  border: 2px solid #fbbf24;
+}
+
+/* Cores para status de premiação */
+.status-max {
+  color: #fbbf24;
+  font-weight: bold;
+  text-shadow: 0 0 10px rgba(251, 191, 36, 0.5);
+}
+
+.status-win {
+  color: #22c55e;
+  font-weight: bold;
+}
+
+.status-lose {
+  color: #ef4444;
+}
+
+/* Estilo para bolas */
+.ball.hit {
+  animation: pulse 2s infinite;
+}
+
+@keyframes pulse {
+  0% { transform: scale(1); box-shadow: 0 0 0 0 rgba(251, 191, 36, 0.7); }
+  70% { transform: scale(1.05); box-shadow: 0 0 0 10px rgba(251, 191, 36, 0); }
+  100% { transform: scale(1); box-shadow: 0 0 0 0 rgba(251, 191, 36, 0); }
+}
+
+.ball.miss {
+  opacity: 0.8;
+}
+
+/* Legenda */
+.legend {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid #1e293b;
+  font-size: 12px;
+}
+
+.legend-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.legend-dot {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+}
+
+.legend-hit {
+  background: #15803d;
+  border: 2px solid #fbbf24;
+}
+
+.legend-miss {
+  background: #7f1d1d;
+  border: 1px solid #ef4444;
+}
+
+.legend-not-suggested {
+  background: #374151;
+  border: 1px solid #6b7280;
+}
+
+/* Melhorar layout do card de simulação */
+#autoSuggested, #autoOfficial {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  gap: 4px;
+  margin: 8px 0;
+}
+
+.ball {
+  width: 50px;
+  height: 50px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 600;
+  font-size: 16px;
+  transition: all 0.3s ease;
+}
+
+.ball:hover {
+  transform: scale(1.1);
+  z-index: 10;
+}
+
+/* Instruções */
+.instructions {
+  background: #0b1220;
+  border: 1px solid #1e293b;
+  border-radius: 8px;
+  padding: 12px;
+  margin: 16px 0;
+  font-size: 13px;
+  color: #94a3b8;
+}
+
+.instructions b {
+  color: #e2e8f0;
+}
 </style>
 
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
@@ -874,11 +1197,7 @@ canvas{ width:100%; height:260px; }
 <div class="wrap">
   <h2>Lotofácil</h2>
 
-  <div class="row" style="margin-bottom:16px;">
-    <button class="pill" onclick="showTab('main')">📊 Atual</button>
-    <button class="pill" onclick="showTab('sim')">🕰️ Simulação</button>
-  </div>
-
+  <!-- ABA ATUAL -->
   <div id="tab-main">
 
     <div class="card">
@@ -900,85 +1219,347 @@ canvas{ width:100%; height:260px; }
 
         <div>Custom:</div>
         <input id="inpStart" type="date" />
-        <input id="inpEnd" type="date" />
-        <div>Pares</div><input id="inpEven" type="number" value="8" />
-        <div>Ímpares</div><input id="inpOdd" type="number" value="7" />
+        <input id="inpEnd"   type="date" />
+        <div>Pares</div><input id="inpEven" type="number" value="8" min="0" max="15" />
+        <div>Ímpares</div><input id="inpOdd" type="number" value="7" min="0" max="15" />
 
-        <button onclick="loadAll(true)">
+        <button id="btnRefresh" type="button" onclick="loadAll(true)">
           <span id="spin" class="spin hidden"></span>
           <span id="btnText">Atualizar</span>
         </button>
       </div>
-    </div>
 
-    <div class="card">
-      <div class="title">Combinação sugerida <span class="pill" id="pillParidade"></span></div>
-      <div id="suggBalls" class="row"></div>
-      <div id="suggStatus" class="muted"></div>
-    </div>
-
-    <div class="card">
-      <div class="title">Frequência</div>
-      <canvas id="chartFreq"></canvas>
-    </div>
-
-  </div>
-
-  <div id="tab-sim" class="hidden">
-    <div class="card">
-      <div class="title">Simulação histórica</div>
-      <div class="row">
-        <input id="inpContest" type="number" placeholder="Ex: 3583" />
-        <button onclick="loadSim()">Simular</button>
+      <div class="row" style="margin-top:10px">
+        <span><b>Atualizado</b> <span id="bdupdated">—</span></span>
+        <span><b>Janela</b> <span id="bdwindow">—</span></span>
+        <span><b>Jogos</b> <span id="bdgames">—</span></span>
+        <span><b>Concurso mais atual</b> <span id="bdlatest">—</span></span>
       </div>
     </div>
 
     <div class="card">
-      <div class="title">Sugestão da época</div>
-      <div id="simSuggested" class="row"></div>
+      <div class="title">
+        Combinação sugerida
+        <span class="pill" id="pillParidade">—</span>
+      </div>
+      <div id="suggBalls" class="row"></div>
+      <div id="suggStatus" class="muted" style="margin-top:8px;"></div>
     </div>
 
     <div class="card">
-      <div class="title">Resultado oficial</div>
-      <div id="simOfficial" class="row"></div>
-      <div id="simHits" class="muted"></div>
+      <div class="title">Frequência por dezena (na janela)</div>
+      <canvas id="chartFreq"></canvas>
     </div>
-  </div>
+    
+    <!-- Instruções sobre o jogo -->
+    <div class="instructions">
+    <b>Como funciona a Lotofácil:</b>
+    <div style="margin-top: 6px;">
+        • Você marca <b>15 números</b> entre os 25 disponíveis (01 a 25)<br>
+        • <span style="color:#22c55e">Ganha com 11, 12, 13, 14 ou 15 acertos</span><br>
+        • <span style="color:#facc15">⚠️ IMPORTANTE: A cada novo concurso, a sugestão SE ATUALIZA automaticamente com os dados mais recentes!</span>
+        • Acima mostra: <span style="color:#fbbf24">● Acertos</span> | 
+        <span style="color:#ef4444">● Erros (sugeridos)</span> | 
+        <span style="color:#6b7280">● Não sugeridos</span>
+    </div>
+    </div>
+
+    <!-- >>> INÍCIO: SIMULAÇÃO AUTOMÁTICA (NOVO CARD) <<< -->
+    <div class="card">
+      <div class="title">📌 Simulação automática — último concurso</div>
+      <div class="row">
+        <div style="flex:1">
+          <div class="muted">Sugestão do método</div>
+          <div id="autoSuggested" class="row"></div>
+        </div>
+        <div style="flex:1">
+          <div class="muted">Resultado oficial</div>
+          <div id="autoOfficial" class="row"></div>
+        </div>
+      </div>
+      <div id="autoResult" class="muted" style="margin-top:8px;"></div>
+    </div>
+        <!-- >>> FIM: SIMULAÇÃO AUTOMÁTICA <<< -->
+
+    <div class="card">
+      <div class="title">Amostra (10 últimos)</div>
+      <table id="tbl">
+        <thead>
+          <tr><th>Concurso</th><th>Data</th><th>Dezenas</th><th>Padrão</th></tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+
+  </div> <!-- Fecha a div#tab-main -->
 
   <div class="muted">Fonte: CAIXA · API pessoal · v{APP_VERSION}</div>
-</div>
+</div> <!-- Fecha a div.wrap -->
 
 <script>
-function pad2(n){ return String(n).padStart(2,'0'); }
-function ball(n){ return `<div class="ball ${n%2===0?'g':'r'}">${pad2(n)}</div>`; }
+// =====================
+// CONFIGURAÇÃO BASE
+// =====================
+const API_BASE_URL = window.location.origin;
+let freqChart = null;
 
-function showTab(t){
-  document.getElementById('tab-main').classList.toggle('hidden', t!=='main');
-  document.getElementById('tab-sim').classList.toggle('hidden', t!=='sim');
+// =====================
+// UTILITÁRIOS
+// =====================
+function pad2(n) {
+  return String(n).padStart(2, '0');
 }
 
-async function j(u){ const r=await fetch(u); return r.json(); }
-
-async function loadAll(){
-  const p=await j('/parity');
-  document.getElementById('pillParidade').innerText=p.suggestion.pattern;
-  document.getElementById('suggBalls').innerHTML=p.suggestion.combo.map(ball).join('');
-  const s=p.suggestion;
-  document.getElementById('suggStatus').innerHTML =
-    s.valid
-      ? '<span class="status-ok">✅ Jogo sugerido</span>'
-      : '<span class="status-warn">⚠️ Fora do critério</span>';
+function ball(n) {
+  const c = (n % 2 === 0) ? 'g' : 'r';
+  return `<div class="ball ${c}">${pad2(n)}</div>`;
 }
 
-async function loadSim(){
-  const c=document.getElementById('inpContest').value;
-  const r=await j(`/simulate?contest=${c}`);
-  document.getElementById('simSuggested').innerHTML=r.suggested_at_time.map(ball).join('');
-  document.getElementById('simOfficial').innerHTML=r.official_result.map(ball).join('');
-  document.getElementById('simHits').innerHTML=`🎯 Acertos: ${r.hits_count}`;
+function safeText(id, val) {
+  const el = document.getElementById(id);
+  if (el) el.innerText = val;
 }
 
-loadAll();
+function safeHtml(id, val) {
+  const el = document.getElementById(id);
+  if (el) el.innerHTML = val;
+}
+
+// =====================
+// API FETCH
+// =====================
+async function j(endpoint, optional = false) {
+  const sep = endpoint.includes('?') ? '&' : '?';
+  const url = `${API_BASE_URL}${endpoint}${sep}t=${Date.now()}`;
+
+  try {
+    const r = await fetch(url, { headers: { 'Accept': 'application/json' } });
+    if (!r.ok) {
+      if (optional && r.status === 404) return null;
+      throw new Error(await r.text());
+    }
+    return r.json();
+  } catch (e) {
+    if (!optional) console.error('[API ERROR]', e);
+    throw e;
+  }
+}
+
+// =====================
+// GRÁFICO (FORA DO loadAll)
+// =====================
+function renderChart(frequencies) {
+  const canvas = document.getElementById('chartFreq');
+  if (!canvas) return;
+
+  if (!Array.isArray(frequencies) || frequencies.length === 0) {
+    canvas.replaceWith(
+      Object.assign(document.createElement('div'), {
+        className: 'muted',
+        innerText: 'Frequência indisponível para a janela selecionada'
+      })
+    );
+    return;
+  }
+
+  const labels = frequencies.map(f => pad2(f.n));
+  const data = frequencies.map(f => f.count);
+
+  if (freqChart) freqChart.destroy();
+
+  freqChart = new Chart(canvas, {
+    type: 'bar',
+    data: { labels, datasets: [{ data }] },
+    options: {
+      responsive: true,
+      plugins: { legend: { display: false } },
+      scales: { y: { beginAtZero: true } }
+    }
+  });
+}
+
+// =====================
+// TABELA
+// =====================
+async function loadTable() {
+  try {
+    const data = await j('/lotofacil?limit=10', true);
+    const tbody = document.querySelector('#tbl tbody');
+    if (!tbody || !data?.results) return;
+
+    tbody.innerHTML = data.results.map(r => `
+      <tr>
+        <td>${r.contest}</td>
+        <td>${r.date || ''}</td>
+        <td>${r.numbers.map(pad2).join(' ')}</td>
+        <td>${r.even_count}-${r.odd_count}</td>
+      </tr>
+    `).join('');
+  } catch {}
+}
+
+// =====================
+// LOAD PRINCIPAL
+// =====================
+async function loadAll(force = false) {
+  const spin = document.getElementById('spin');
+  const btn = document.getElementById('btnText');
+
+  spin?.classList.remove('hidden');
+  if (btn) btn.innerText = 'Atualizando...';
+
+  try {
+    const w = document.getElementById('selWindow')?.value || '3m';
+    const E = document.getElementById('inpEven')?.value || 8;
+    const O = document.getElementById('inpOdd')?.value || 7;
+
+    const p = await j(`/parity?window=${w}&even=${E}&odd=${O}${force ? '&force=true' : ''}`);
+
+    safeText('bdupdated', p.updated_at || '—');
+    safeText('bdwindow', `${p.start || '—'} → ${p.end || '—'}`);
+    safeText('bdgames', p.considered_games || 0);
+
+    if (p.suggestion) {
+      safeHtml('pillParidade', p.suggestion.pattern);
+      safeHtml('suggBalls', p.suggestion.combo.map(ball).join(''));
+    }
+
+    renderChart(p.frequencies);
+    loadTable();
+
+  } catch (e) {
+    console.error(e);
+    safeHtml('suggStatus', '⚠️ Erro ao carregar dados');
+  } finally {
+    spin?.classList.add('hidden');
+    if (btn) btn.innerText = 'Atualizar';
+  }
+}
+
+// =====================
+// SIMULAÇÃO AUTOMÁTICA (VERSÃO FINAL)
+// =====================
+async function loadAutoSim() {
+  const container = document.getElementById('autoResult');
+  if (!container) return;
+  
+  container.innerHTML = '<div class="muted">Carregando simulação...</div>';
+  
+  try {
+    const r = await j('/backtest/latest', true);
+    
+    if (!r || !r.ok) {
+      safeHtml('autoResult', '⚠️ Backtest indisponível');
+      return;
+    }
+
+    // FUNÇÃO PARA CRIAR BOLAS COM CORES CORRETAS
+    function createBall(number, isHit, isSuggested = true) {
+      const padded = pad2(number);
+      
+      if (isHit) {
+        // ACERTOU: VERDE COM BORDA DOURADA
+        return `<div class="ball hit" title="Acertou: ${padded}" 
+                  style="background:#15803d; border:3px solid #fbbf24; 
+                         box-shadow:0 0 10px rgba(251, 191, 36, 0.5);
+                         font-weight:bold;">
+                  ${padded}
+                </div>`;
+      } else if (isSuggested) {
+        // SUGERIU MAS NÃO ACERTOU: VERMELHO
+        return `<div class="ball miss" title="Errou: ${padded}" 
+                  style="background:#7f1d1d; border:1px solid #ef4444; color:#fee2e2;">
+                  ${padded}
+                </div>`;
+      } else {
+        // NÃO FOI SUGERIDO (apenas no resultado oficial): CINZA
+        return `<div class="ball" title="${padded}" 
+                  style="background:#374151; border:1px solid #6b7280; color:#d1d5db;">
+                  ${padded}
+                </div>`;
+      }
+    }
+
+    // Calcular acertos e determinar se ganhou
+    const hits = r.hits || [];
+    const hitsCount = r.hits_count || 0;
+    const hitSet = new Set(hits);
+    const suggestedSet = new Set(r.suggested || []);
+    
+    // Verificar premiação
+    let premio = "";
+    let premioClass = "";
+    if (hitsCount >= 15) {
+      premio = "🏆 PRÊMIO MÁXIMO! (15 acertos)";
+      premioClass = "status-max";
+    } else if (hitsCount >= 14) {
+      premio = "💰 GANHOU! (14 acertos)";
+      premioClass = "status-win";
+    } else if (hitsCount >= 13) {
+      premio = "💰 GANHOU! (13 acertos)";
+      premioClass = "status-win";
+    } else if (hitsCount >= 12) {
+      premio = "💰 GANHOU! (12 acertos)";
+      premioClass = "status-win";
+    } else if (hitsCount >= 11) {
+      premio = "💰 GANHOU! (11 acertos)";
+      premioClass = "status-win";
+    } else {
+      premio = "❌ Não ganhou (menos de 11 acertos)";
+      premioClass = "status-lose";
+    }
+
+    // Renderizar sugestão (15 números)
+    if (r.suggested && r.suggested.length === 15) {
+      const suggestedHtml = r.suggested.map(n => 
+        createBall(n, hitSet.has(n), true)
+      ).join('');
+      safeHtml('autoSuggested', suggestedHtml);
+    }
+
+    // Renderizar oficial (15 números)
+    if (r.official && r.official.length === 15) {
+      const officialHtml = r.official.map(n => 
+        createBall(n, hitSet.has(n), suggestedSet.has(n))
+      ).join('');
+      safeHtml('autoOfficial', officialHtml);
+    }
+
+    // Mostrar resultado com premiação
+    const dateStr = r.contest_date ? 
+      r.contest_date.split('-').reverse().join('/') : 
+      'Data desconhecida';
+    
+    // Na parte que mostra o resultado, adicione:
+    safeHtml(
+    'autoResult',
+    `<div class="${premioClass}" style="margin-bottom:8px; font-size:14px;">
+        ${premio}
+    </div>
+    <div style="margin-bottom:8px;">
+        🎯 <b>${hitsCount} acertos</b> no concurso <b>${r.contest}</b> (${dateStr})
+    </div>
+    <div class="muted" style="font-size:11px; margin-bottom:12px;">
+        📊 Paridade ${r.pattern || '—'} · 
+        📈 Analisou ${r.historical_draws_used || 'N/A'} concursos anteriores ·
+        ⚡ <span style="color:#facc15">Atualiza a cada novo sorteio!</span>
+    </div>
+    <div class="legend">...</div>`
+    );
+
+  } catch (e) {
+    console.error('Erro no auto-sim:', e);
+    safeHtml('autoResult', '⚠️ Erro ao executar backtest');
+  }
+}
+
+// =====================
+// INIT
+// =====================
+window.addEventListener('DOMContentLoaded', () => {
+  loadAll(false);
+  loadAutoSim();
+});
 </script>
 
 </body>
@@ -989,8 +1570,7 @@ loadAll();
 
 @app.get("/simulate", response_class=JSONResponse)
 async def simulate(
-    contest: int = Query(..., ge=1),
-    window: str = "3m"
+    contest: int = Query(..., ge=1)
 ):
     """
     Simulação histórica:
@@ -1010,7 +1590,7 @@ async def simulate(
             content={"ok": False, "error": "Concurso não encontrado"}
         )
 
-    target_date = target["date"]
+    target_date = parse_draw_date(target["date"])
     target_numbers = target["numbers"]
 
     # --------------------------------------------------
@@ -1018,7 +1598,7 @@ async def simulate(
     # --------------------------------------------------
     past_draws = [
         d for d in all_draws
-        if d["date"] < target_date
+        if parse_draw_date(d["date"]) and parse_draw_date(d["date"]) < target_date
     ]
 
     if len(past_draws) < 20:
@@ -1057,6 +1637,199 @@ async def simulate(
         "pattern": sugg.get("pattern"),
         "method": "historical_simulation",
         "updated_at": dt.datetime.now(BRT).strftime("%d/%m/%Y %H:%M:%S"),
+    }
+
+
+@app.get("/backtest/latest")
+async def backtest_latest():
+    """
+    Backtest automático CORRETO:
+    Usa apenas concursos ANTERIORES ao último concurso.
+    """
+    logger.info("[BACKTEST] Iniciando backtest automático CORRETO")
+
+    try:
+        # 1. Buscar o último concurso
+        latest = await _get_latest()
+        latest_contest = int(latest.get("contest") or 0)
+
+        logger.info(
+            f"[BACKTEST] Último concurso identificado: {latest_contest}")
+
+        if latest_contest <= 1:
+            logger.warning("[BACKTEST] Concurso insuficiente para análise")
+            return {
+                "ok": False,
+                "error": "Não há concurso suficiente para backtest"
+            }
+
+        # 2. Buscar resultado oficial do último concurso
+        logger.debug(f"[BACKTEST] Buscando dados do concurso {latest_contest}")
+        latest_draw = await _get_concurso(latest_contest)
+
+        if not latest_draw:
+            logger.error(
+                f"[BACKTEST] Concurso {latest_contest} não encontrado")
+            return {
+                "ok": False,
+                "error": "Não foi possível obter o último concurso"
+            }
+
+        official_numbers = latest_draw.get("numbers", [])
+        latest_date = parse_draw_date(latest_draw.get("date", ""))
+
+        logger.info(f"[BACKTEST] Concurso {latest_contest} em {latest_date}")
+        logger.debug(
+            f"[BACKTEST] Resultado oficial: {sorted(official_numbers)}")
+
+        # 3. Coletar SOMENTE concursos ANTERIORES
+        logger.info(
+            "[BACKTEST] Coletando concursos ANTERIORES (backtest real)...")
+
+        # Vamos buscar concursos um por um até termos pelo menos 50 anteriores
+        previous_draws = []
+        contest_to_check = latest_contest - 1
+        max_attempts = 150  # limite de segurança
+
+        while contest_to_check >= 1 and len(previous_draws) < 50 and max_attempts > 0:
+            d = await _get_concurso(contest_to_check)
+            if d:
+                previous_draws.append(d)
+                logger.debug(
+                    f"[BACKTEST] Adicionado concurso anterior: {contest_to_check}")
+
+            contest_to_check -= 1
+            max_attempts -= 1
+
+            # Pausa para não sobrecarregar
+            if max_attempts % 20 == 0:
+                await asyncio.sleep(0.1)
+
+        logger.info(
+            f"[BACKTEST] {len(previous_draws)} concursos anteriores coletados")
+
+        if len(previous_draws) < 20:
+            logger.warning(
+                f"[BACKTEST] Histórico insuficiente: {len(previous_draws)} concursos")
+            return {
+                "ok": False,
+                "error": f"Histórico insuficiente: apenas {len(previous_draws)} concursos anteriores"
+            }
+
+        # 4. Gerar sugestão baseada APENAS nos concursos anteriores
+        logger.info(
+            "[BACKTEST] Executando Livro Negro com dados históricos...")
+        suggestion = build_parity_suggestion(
+            previous_draws,
+            even_needed=8,
+            odd_needed=7
+        )
+
+        suggested_numbers = suggestion.get("combo", [])
+
+        if len(suggested_numbers) != 15:
+            logger.error(
+                f"[BACKTEST] Sugestão incompleta: {len(suggested_numbers)} números")
+            return {
+                "ok": False,
+                "error": "Sugestão incompleta gerada"
+            }
+
+        logger.debug(
+            f"[BACKTEST] Sugestão gerada: {sorted(suggested_numbers)}")
+
+        # 5. Calcular acertos
+        hits = sorted(set(suggested_numbers) & set(official_numbers))
+
+        logger.info(
+            f"[BACKTEST] Resultado: {len(hits)} acertos no concurso {latest_contest}")
+
+        return {
+            "ok": True,
+            "contest": latest_contest,
+            "contest_date": latest_date.isoformat() if latest_date else None,
+            "suggested": suggested_numbers,
+            "official": official_numbers,
+            "hits": hits,
+            "hits_count": len(hits),
+            "pattern": suggestion.get("pattern", ""),
+            "parity": suggestion.get("parity", {}),
+            "valid": suggestion.get("valid", False),
+            "rules": suggestion.get("rules", {}),
+            "method": "backtest_real",
+            "historical_draws_used": len(previous_draws),
+            "oldest_draw_used": previous_draws[-1]["contest"] if previous_draws else None,
+            "updated_at": dt.datetime.now(BRT).strftime("%d/%m/%Y %H:%M:%S"),
+        }
+
+    except Exception as e:
+        logger.error(f"[BACKTEST] Erro crítico: {str(e)}", exc_info=True)
+        return {
+            "ok": False,
+            "error": f"Erro interno: {str(e)}"
+        }
+
+
+@app.get("/debug/backtest")
+async def debug_backtest():
+    """Endpoint para diagnóstico do backtest"""
+    try:
+        # Testar cada componente
+        latest = await _get_latest()
+        latest_contest = latest.get("contest", 0)
+
+        if latest_contest:
+            latest_draw = await _get_concurso(latest_contest)
+            historical = await collect_last_n(50)
+
+            return {
+                "ok": True,
+                "latest_contest": latest_contest,
+                "latest_draw_exists": bool(latest_draw),
+                "historical_count": len(historical),
+                "historical_contests": [d.get("contest") for d in historical[:5]],
+                "timestamp": dt.datetime.now(BRT).strftime("%d/%m/%Y %H:%M:%S")
+            }
+        else:
+            return {"ok": False, "error": "Não foi possível obter o último concurso"}
+
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+@app.get("/backtest/history")
+async def backtest_history(limit: int = Query(10, ge=1, le=50)):
+    """Mostra a evolução das sugestões ao longo do tempo"""
+    # Implementação que pega os últimos N concursos
+    # e mostra a sugestão que seria feita para cada um
+    # e quantos acertos teria dado
+
+
+@app.get("/render-test")
+async def render_test():
+    """Teste específico para Render"""
+    import os
+    return {
+        "status": "ok",
+        "service": "lotofacil-api",
+        "port": os.getenv("PORT", "10000"),
+        "python_version": os.getenv("PYTHON_VERSION", "unknown"),
+        "render": True,
+        "timestamp": dt.datetime.now(BRT).strftime("%d/%m/%Y %H:%M:%S")
+    }
+
+
+@app.get("/debug/render")
+async def debug_render():
+    """Endpoint específico para debug no Render"""
+    import os
+    return {
+        "status": "ok",
+        "render": True,
+        "env_vars": {k: v for k, v in os.environ.items() if "PYTHON" in k or "TIME" in k},
+        "cwd": os.getcwd(),
+        "files": os.listdir("."),
+        "timestamp": dt.datetime.now(BRT).strftime("%d/%m/%Y %H:%M:%S")
     }
 
 

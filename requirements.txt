@@ -1,7 +1,5 @@
-fastapi==0.115.0
-uvicorn[standard]==0.30.5
-httpx==0.27.2
-beautifulsoup4
-lxml
-pydantic
-playwright==1.48.0
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+httpx==0.25.1
+python-multipart==0.0.6
+pydantic==2.5.0
