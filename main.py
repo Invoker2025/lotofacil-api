@@ -9,7 +9,7 @@ import asyncio  # Para a pausa na coleta
 from typing import Any, Dict, List, Tuple, Optional
 from pathlib import Path
 import httpx
-from fastapi import FastAPI, HTTPException, Query, Response
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -1037,184 +1037,67 @@ async def parity(
 
 @app.get("/app", response_class=HTMLResponse)
 @app.get("/app/", response_class=HTMLResponse)
-async def ui(response: Response):
-    response.headers["Cache-Control"] = "no-store"
-
+async def ui():
     html = """
 <!doctype html>
 <html lang="pt-br">
 <head>
 <meta charset="utf-8" />
-<title>LotofÃ¡cil</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Lotofácil</title>
 <link rel="manifest" href="/static/manifest.webmanifest?v=3">
 <link rel="icon" href="/static/favicon.ico">
 <meta name="theme-color" content="#0f172a">
-
 <style>
-:root{color-scheme:dark}
-body{background:#0f172a;color:#e2e8f0;font-family:system-ui}
-.wrap{max-width:1024px;margin:24px auto;padding:0 16px}
-.card{background:#0b1220;border:1px solid #1e293b;border-radius:12px;padding:16px;margin:16px 0}
-.row{display:flex;gap:12px;flex-wrap:wrap;align-items:center}
-input,select,button{background:#0b1220;color:#e2e8f0;border:1px solid #1e293b;border-radius:8px;padding:8px}
-button{cursor:pointer}
-.ball{width:48px;height:48px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:700}
-.ball.hit{background:#15803d;border:3px solid #fbbf24}
-.ball.r{background:#7f1d1d;border:1px solid #ef4444}
-.ball.g{background:#14532d;border:1px solid #22c55e}
-.muted{color:#94a3b8;font-size:12px}
+:root{color-scheme:dark;--bg:#0f172a;--panel:#111827;--panel2:#0b1220;--line:#243244;--text:#e5e7eb;--muted:#94a3b8;--green:#22c55e;--green-bg:#12351f;--red:#ef4444;--red-bg:#3a1218;--yellow:#facc15}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:Inter,ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif}.wrap{width:min(1120px,100%);margin:0 auto;padding:24px 16px 40px}.topbar{display:flex;justify-content:space-between;gap:16px;align-items:flex-end;margin-bottom:18px}h1{font-size:28px;line-height:1.1;margin:0;font-weight:800}.subtitle{margin-top:6px;color:var(--muted);font-size:14px}.status{color:var(--muted);font-size:13px;text-align:right}.grid{display:grid;grid-template-columns:360px 1fr;gap:16px;align-items:start}.card{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:16px}.card+.card{margin-top:16px}.title{display:flex;justify-content:space-between;gap:12px;align-items:center;margin-bottom:14px;font-weight:800}.pill{border:1px solid var(--line);border-radius:999px;padding:5px 10px;color:var(--muted);font-size:12px;font-weight:700}.form{display:grid;gap:14px}.field{display:grid;gap:6px}label{color:var(--muted);font-size:12px;font-weight:700;text-transform:uppercase}input,select,button{width:100%;min-height:42px;background:var(--panel2);color:var(--text);border:1px solid var(--line);border-radius:8px;padding:9px 10px;font:inherit}button{cursor:pointer;background:#0e7490;border-color:#0891b2;font-weight:800}button:disabled{opacity:.65;cursor:wait}.split{display:grid;grid-template-columns:1fr 1fr;gap:10px}.summary{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-top:14px}.metric{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:10px}.metric span{display:block;color:var(--muted);font-size:11px;font-weight:700;text-transform:uppercase}.metric strong{display:block;margin-top:4px;font-size:18px}.balls{display:grid;grid-template-columns:repeat(auto-fill,minmax(46px,1fr));gap:10px}.ball{aspect-ratio:1;border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:900;font-size:16px;border:2px solid var(--line)}.ball.even{background:var(--green-bg);border-color:var(--green);color:#dcfce7}.ball.odd{background:var(--red-bg);border-color:var(--red);color:#fee2e2}.ball.hit{border-color:var(--yellow);box-shadow:0 0 0 3px rgba(250,204,21,.22),0 0 18px rgba(250,204,21,.2);color:#fff7cc}.result-line{color:var(--muted);font-size:14px;line-height:1.5}.result-line strong{color:var(--text)}.legend{display:flex;gap:12px;flex-wrap:wrap;margin-top:12px;color:var(--muted);font-size:12px}.legend-item{display:flex;gap:6px;align-items:center}.dot{width:12px;height:12px;border-radius:50%;border:2px solid var(--line)}.dot.even{background:var(--green-bg);border-color:var(--green)}.dot.odd{background:var(--red-bg);border-color:var(--red)}.dot.hit{background:#3f3105;border-color:var(--yellow)}.error{color:#fecaca}@media(max-width:820px){.topbar{display:block}.status{text-align:left;margin-top:10px}.grid{grid-template-columns:1fr}.summary{grid-template-columns:1fr}.split{grid-template-columns:1fr}}
 </style>
-
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 </head>
 <body>
-
 <div class="wrap">
-<h2>LotofÃ¡cil ðŸš¨ TESTE RENDER 01</h2>
-
-
-<div class="card row">
-Janela
-<select id="selWindow">
-<option value="1m">1 mÃªs</option>
-<option value="3m" selected>3 meses</option>
-<option value="6m">6 meses</option>
-<option value="all">Tudo</option>
-</select>
-
-Pares <input id="inpEven" type="number" value="8" min="0" max="15">
-Ãmpares <input id="inpOdd" type="number" value="7" min="0" max="15">
-
-<button onclick="loadAll(true)">Atualizar</button>
+  <div class="topbar"><div><h1>Lotofácil</h1><div class="subtitle">Sugestão por frequência e paridade com backtest automático do último concurso.</div></div><div id="requestStatus" class="status">Aguardando dados</div></div>
+  <div class="grid">
+    <aside>
+      <div class="card"><div class="title">Parâmetros <span id="currentPattern" class="pill">8-7</span></div><div class="form"><div class="field"><label for="selWindow">Janela</label><select id="selWindow"><option value="1m">1 mês</option><option value="3m" selected>3 meses</option><option value="6m">6 meses</option><option value="all">Tudo</option></select></div><div class="split"><div class="field"><label for="inpEven">Pares</label><input id="inpEven" type="number" value="8" min="0" max="15" inputmode="numeric"></div><div class="field"><label for="inpOdd">Ímpares</label><input id="inpOdd" type="number" value="7" min="0" max="15" inputmode="numeric"></div></div><button id="btnRefresh" type="button">Atualizar</button></div><div class="summary"><div class="metric"><span>Jogos</span><strong id="gamesMetric">-</strong></div><div class="metric"><span>Paridade</span><strong id="patternMetric">8-7</strong></div><div class="metric"><span>Acertos</span><strong id="hitsMetric">-</strong></div></div></div>
+      <div class="card"><div class="title">Legenda</div><div class="legend"><div class="legend-item"><span class="dot even"></span>Par</div><div class="legend-item"><span class="dot odd"></span>Ímpar</div><div class="legend-item"><span class="dot hit"></span>Acerto</div></div></div>
+    </aside>
+    <main>
+      <div class="card"><div class="title">Combinação sugerida <span id="suggestionPattern" class="pill">-</span></div><div id="suggBalls" class="balls"></div></div>
+      <div class="card"><div class="title">Simulação automática <span id="contestBadge" class="pill">Último concurso</span></div><div id="autoResult" class="result-line">Carregando simulação...</div></div>
+      <div class="split"><div class="card"><div class="title">Sugestão testada</div><div id="autoSuggested" class="balls"></div></div><div class="card"><div class="title">Resultado oficial</div><div id="autoOfficial" class="balls"></div></div></div>
+    </main>
+  </div>
 </div>
-
-<div class="card">
-<b>CombinaÃ§Ã£o sugerida</b>
-<div id="suggBalls" class="row"></div>
-</div>
-
-<div class="card">
-<b>ðŸ“Œ SimulaÃ§Ã£o automÃ¡tica â€” Ãºltimo concurso</b>
-<div id="parityIndicator" class="muted"></div>
-<div class="row">
-<div id="autoSuggested" class="row"></div>
-<div id="autoOfficial" class="row"></div>
-</div>
-<div id="autoResult" class="muted"></div>
-</div>
-</div>
-
 <script>
 const API = location.origin;
 let activeController = null;
 let requestSeq = 0;
-
 const pad = n => String(n).padStart(2,'0');
 const qs = params => new URLSearchParams(params).toString();
 const el = id => document.getElementById(id);
-
-function readParity(){
-  let E = parseInt(el('inpEven').value, 10);
-  let O = parseInt(el('inpOdd').value, 10);
-  if (!Number.isInteger(E)) E = 8;
-  if (!Number.isInteger(O)) O = 15 - E;
-  E = Math.max(0, Math.min(15, E));
-  O = Math.max(0, Math.min(15, O));
-  if (E + O !== 15) O = 15 - E;
-  el('inpEven').value = E;
-  el('inpOdd').value = O;
-  return { E, O };
-}
-
-async function api(path, params, signal){
-  const url = `${API}${path}?${qs({ ...params, t: Date.now() })}`;
-  const r = await fetch(url, {
-    cache: 'no-store',
-    headers: { 'Cache-Control': 'no-cache' },
-    signal
-  });
-  const data = await r.json();
-  if (!r.ok || data.ok === false) {
-    throw new Error(data.detail || data.error || `HTTP ${r.status}`);
-  }
-  return data;
-}
-
-async function loadAll(force=false){
-  const seq = ++requestSeq;
-  if (activeController) activeController.abort();
-  activeController = new AbortController();
-  const signal = activeController.signal;
-
-  const { E, O } = readParity();
-  const w = el('selWindow').value;
-
-  el('suggBalls').innerHTML = '';
-  el('autoSuggested').innerHTML = '';
-  el('autoOfficial').innerHTML = '';
-  el('autoResult').innerText = 'Recalculando...';
-  el('parityIndicator').innerText = `Paridade solicitada: ${E}-${O}`;
-
-  try {
-    const p = await api('/parity', {
-      window: w,
-      even: E,
-      odd: O,
-      ...(force ? { force: true } : {})
-    }, signal);
-    if (seq !== requestSeq) return;
-
-    el('suggBalls').innerHTML =
-      p.suggestion.combo.map(n =>
-        `<div class="ball g">${pad(n)}</div>`
-      ).join('');
-
-    const d = await api('/backtest/latest', { even: E, odd: O }, signal);
-    if (seq !== requestSeq) return;
-
-    const hit = new Set(d.hits || []);
-    el('parityIndicator').innerText =
-      `Paridade usada: ${d.pattern} | Concurso ${d.contest}`;
-
-    el('autoSuggested').innerHTML =
-      d.suggested.map(n =>
-        `<div class="ball g ${hit.has(n) ? 'hit' : ''}">${pad(n)}</div>`
-      ).join('');
-
-    el('autoOfficial').innerHTML =
-      d.official.map(n =>
-        `<div class="ball r ${hit.has(n) ? 'hit' : ''}">${pad(n)}</div>`
-      ).join('');
-
-    el('autoResult').innerText =
-      `${d.hits_count} acertos | Sugerida: ${d.suggested.join('-')}`;
-  } catch (err) {
-    if (err.name === 'AbortError') return;
-    el('autoResult').innerText = `Erro: ${err.message}`;
-    el('parityIndicator').innerText = `Paridade solicitada: ${E}-${O}`;
-  }
-}
-
-el('inpEven').addEventListener('input', () => {
-  const E = Math.max(0, Math.min(15, parseInt(el('inpEven').value, 10) || 0));
-  el('inpOdd').value = 15 - E;
-  loadAll(false);
-});
-el('inpOdd').addEventListener('input', () => {
-  const O = Math.max(0, Math.min(15, parseInt(el('inpOdd').value, 10) || 0));
-  el('inpEven').value = 15 - O;
-  loadAll(false);
-});
-el('selWindow').addEventListener('change', () => loadAll(false));
-
-loadAll(false);
+function clampParityValue(value, fallback){const parsed=parseInt(value,10);return Number.isInteger(parsed)?Math.max(0,Math.min(15,parsed)):fallback;}
+async function api(path, params, signal){const url=`${API}${path}?${qs({...params,t:Date.now()})}`;const r=await fetch(url,{cache:'no-store',headers:{'Cache-Control':'no-cache','Accept':'application/json'},signal});const data=await r.json();if(!r.ok||data.ok===false){throw new Error(data.detail||data.error||`HTTP ${r.status}`)}return data;}
+function updatePattern(E,O){const pattern=`${E}-${O}`;el('currentPattern').innerText=pattern;el('patternMetric').innerText=pattern;}
+function syncFromEven(){const E=clampParityValue(el('inpEven').value,8);el('inpEven').value=E;el('inpOdd').value=15-E;updatePattern(E,15-E);}
+function syncFromOdd(){const O=clampParityValue(el('inpOdd').value,7);el('inpOdd').value=O;el('inpEven').value=15-O;updatePattern(15-O,O);}
+function readParity(){let E=clampParityValue(el('inpEven').value,8);let O=clampParityValue(el('inpOdd').value,15-E);if(E+O!==15)O=15-E;el('inpEven').value=E;el('inpOdd').value=O;updatePattern(E,O);return{E,O};}
+function renderBalls(targetId,numbers,hits=new Set()){el(targetId).innerHTML=(numbers||[]).map(n=>{const parityClass=n%2===0?'even':'odd';const hitClass=hits.has(n)?' hit':'';return `<div class="ball ${parityClass}${hitClass}" title="Dezena ${pad(n)}">${pad(n)}</div>`}).join('');}
+function setLoading(E,O){el('requestStatus').innerText=`Atualizando ${E}-${O}...`;el('suggBalls').innerHTML='';el('autoSuggested').innerHTML='';el('autoOfficial').innerHTML='';el('autoResult').innerText='Recalculando com a paridade selecionada...';el('hitsMetric').innerText='-';el('btnRefresh').disabled=true;}
+function setDone(){el('requestStatus').innerText='Dados atualizados';el('btnRefresh').disabled=false;}
+function setError(message){el('requestStatus').innerText='Erro ao atualizar';el('autoResult').innerHTML=`<span class="error">${message}</span>`;el('btnRefresh').disabled=false;}
+async function loadAll(force=false){const seq=++requestSeq;if(activeController)activeController.abort();activeController=new AbortController();const signal=activeController.signal;const {E,O}=readParity();const w=el('selWindow').value;setLoading(E,O);try{const p=await api('/parity',{window:w,even:E,odd:O,...(force?{force:true}:{})},signal);if(seq!==requestSeq)return;renderBalls('suggBalls',p.suggestion.combo);el('suggestionPattern').innerText=p.pattern||p.suggestion.pattern||`${E}-${O}`;el('gamesMetric').innerText=p.considered_games??'-';const b=await api('/backtest/latest',{even:E,odd:O},signal);if(seq!==requestSeq)return;const hits=new Set(b.hits||[]);renderBalls('autoSuggested',b.suggested,hits);renderBalls('autoOfficial',b.official,hits);el('contestBadge').innerText=`Concurso ${b.contest}`;el('hitsMetric').innerText=b.hits_count;el('patternMetric').innerText=b.pattern;el('currentPattern').innerText=b.pattern;el('autoResult').innerHTML=`<strong>${b.hits_count} acertos</strong> usando paridade <strong>${b.pattern}</strong>. Endpoint chamado: <strong>/backtest/latest?even=${E}&odd=${O}</strong>`;setDone();}catch(err){if(err.name==='AbortError')return;setError(err.message||'Falha inesperada');}}
+document.addEventListener('DOMContentLoaded',()=>{el('inpEven').addEventListener('input',()=>{syncFromEven();loadAll(false);});el('inpOdd').addEventListener('input',()=>{syncFromOdd();loadAll(false);});el('selWindow').addEventListener('change',()=>loadAll(false));el('btnRefresh').addEventListener('click',()=>loadAll(true));loadAll(false);});
 </script>
-
 </body>
 </html>
 """
-    return HTMLResponse(html.replace("{APP_VERSION}", APP_VERSION))
-
+    return HTMLResponse(
+        html.replace("{APP_VERSION}", APP_VERSION),
+        headers={
+            "Cache-Control": "no-store",
+            "Content-Type": "text/html; charset=utf-8",
+        }
+    )
 
 @app.get("/simulate", response_class=JSONResponse)
 async def simulate(
