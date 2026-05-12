@@ -1509,33 +1509,58 @@ def plan_rank_key(candidate: Dict[str, Any]) -> Tuple[float, int, int, int, int]
     )
 
 
+def parity_backtest_settings_for_window(
+    window: str,
+    limit: Optional[int] = None,
+    history: Optional[int] = None,
+) -> Tuple[int, int]:
+    if limit is not None and history is not None:
+        return limit, history
+
+    if window == "all":
+        return 80, 120
+
+    m = re.fullmatch(r"(\d{1,2})m", window)
+    months = int(m.group(1)) if m else 3
+
+    if months <= 1:
+        return 12, 30
+    if months <= 3:
+        return 30, 50
+    if months <= 6:
+        return 60, 80
+    return 80, 120
+
+
 @app.get("/plan/recommended", response_class=JSONResponse)
 async def plan_recommended(
     window: str = Query("3m", pattern=r"^((\d{1,2})m|all)$"),
-    limit: int = Query(30, ge=5, le=80),
-    history: int = Query(50, ge=20, le=120),
+    limit: Optional[int] = Query(None, ge=5, le=80),
+    history: Optional[int] = Query(None, ge=20, le=120),
     force: bool = False,
 ):
+    effective_limit, effective_history = parity_backtest_settings_for_window(
+        window, limit=limit, history=history)
     cache = None if force else _agg_get(
-        "plan_recommended", window=window, limit=limit, history=history)
+        "plan_recommended", window=window, limit=effective_limit, history=effective_history)
     if cache:
         data = cache.copy()
         ts = data.pop("_ts", None)
         data["cache_age_seconds"] = int(time.time() - ts) if ts else None
         return data
 
-    historical_draws = await collect_last_n(limit + history + 5)
-    if len(historical_draws) < history + 1:
+    historical_draws = await collect_last_n(effective_limit + effective_history + 5)
+    if len(historical_draws) < effective_history + 1:
         return {
             "ok": False,
             "error": f"Historico insuficiente: {len(historical_draws)} concursos coletados",
-            "required_minimum": history + 1,
+            "required_minimum": effective_history + 1,
         }
 
     candidates = []
     for even, odd in PARITY_CANDIDATES:
         summary = summarize_derived_backtest(
-            historical_draws, even=even, odd=odd, limit=limit, history=history)
+            historical_draws, even=even, odd=odd, limit=effective_limit, history=effective_history)
         candidates.append({
             "even": even,
             "odd": odd,
@@ -1564,11 +1589,17 @@ async def plan_recommended(
         "candidates": ranked,
         "suggestion": suggestion,
         "considered_games": len(current_draws),
+        "parity_backtest": {
+            "limit": effective_limit,
+            "history": effective_history,
+            "source": "query" if limit is not None and history is not None else "window",
+        },
         "method": "auto_parity_derived_backtest",
         "updated_at": dt.datetime.now(BRT).strftime("%d/%m/%Y %H:%M:%S"),
         "cache_age_seconds": None,
     }
-    _agg_put(payload, "plan_recommended", window=window, limit=limit, history=history)
+    _agg_put(payload, "plan_recommended", window=window,
+             limit=effective_limit, history=effective_history)
     payload["cache_age_seconds"] = 0
     return payload
 
@@ -1658,7 +1689,7 @@ function renderDerivedGames(games=[]){const list=games.slice(0,6);el('derivedSta
 function renderPlan(E,O,games=[],summary={}){const qtd=Math.min(games.length||6,6);el('labStatus').innerText='Pronto';el('labContent').innerHTML=`<div class="play-plan"><strong>Jogar o conjunto completo</strong><div class="play-plan-actions"><span class="badge badge-green">${qtd} jogos recomendados</span><span class="badge badge-blue">Paridade ${E}-${O}</span></div><div class="loading-text">Use os jogos listados em “Jogos”.</div></div>`;}
 function renderHistory(draws){el('historyList').innerHTML=(draws||[]).map(d=>{const nums=d.numbers||[];const even=d.even_count??nums.filter(n=>n%2===0).length;const odd=d.odd_count??nums.filter(n=>n%2===1).length;const balls=nums.map(n=>`<span class="ball small ${n%2===0?'even':'odd'}">${pad(n)}</span>`).join('');return `<div class="history-card"><div class="history-meta"><div class="history-contest">Concurso ${d.contest}</div><div class="history-date">${d.date||'-'}</div></div><div class="history-numbers">${balls}</div><div class="history-pattern badge badge-blue">${even}-${odd}</div></div>`}).join('');}
 async function loadHistory(){el('historyStatus').innerText='Carregando';el('historyList').innerHTML='<div class="loading-text">Carregando últimos concursos...</div>';try{const data=await api('/lotofacil',{limit:10});renderHistory(data.results||[]);el('historyStatus').innerText=`${data.count||0} jogos`;}catch(err){el('historyStatus').innerText='Erro';el('historyList').innerHTML=`<span class="error">${err.message||'Falha ao carregar histórico'}</span>`;}}
-async function loadAll(force=false){const seq=++requestSeq;if(activeController)activeController.abort();activeController=new AbortController();const signal=activeController.signal;const w=el('selWindow').value;setLoading();try{const p=await api('/plan/recommended',{window:w,limit:30,history:50,...(force?{force:true}:{})},signal);if(seq!==requestSeq)return;const rec=p.recommended||{};const E=rec.even;const O=rec.odd;updatePattern(E,O);renderDerivedGames(p.suggestion.games||[]);el('gamesMetric').innerText=p.considered_games??'-';el('autoResult').innerHTML='<div class="loading-text">Executando backtest...</div>';const backtestPath=`/backtest/latest?even=${E}&odd=${O}`;console.log('[APP] Backtest:',backtestPath);const b=await api('/backtest/latest',{even:E,odd:O},signal);if(seq!==requestSeq)return;const hits=new Set(b.hits||[]);const didWin=(b.hits_count||0)>=11;const shownGames=b.games_tested||p.suggestion.games||[];renderBalls('autoOfficial',b.official,hits);renderDerivedGames(shownGames);el('simulationCard').className=`card simulation-main ${didWin?'win':'neutral'}`;el('contestBadge').className='badge badge-blue';el('contestBadge').innerText=`Concurso ${b.contest}`;el('hitsMetric').innerText=b.hits_count;el('patternMetric').innerText=b.pattern;el('currentPattern').innerText=b.pattern;el('autoResult').innerHTML=`<div class="hit-display">${didWin?'&#9989;':'&bull;'} ${b.hits_count} acertos</div><div class="sim-badges"><span class="badge ${didWin?'badge-green':'badge-neutral'}">${b.hits_count} acertos</span><span class="badge badge-blue">Paridade ${b.pattern}</span><span class="badge badge-yellow">Concurso ${b.contest}</span></div>`;renderPlan(E,O,shownGames,rec.summary||{});setDone();}catch(err){if(err.name==='AbortError')return;setError(err.message||'Falha inesperada');}}
+async function loadAll(force=false){const seq=++requestSeq;if(activeController)activeController.abort();activeController=new AbortController();const signal=activeController.signal;const w=el('selWindow').value;setLoading();try{const p=await api('/plan/recommended',{window:w,...(force?{force:true}:{})},signal);if(seq!==requestSeq)return;const rec=p.recommended||{};const E=rec.even;const O=rec.odd;updatePattern(E,O);renderDerivedGames(p.suggestion.games||[]);el('gamesMetric').innerText=p.considered_games??'-';el('autoResult').innerHTML='<div class="loading-text">Executando backtest...</div>';const backtestPath=`/backtest/latest?even=${E}&odd=${O}`;console.log('[APP] Backtest:',backtestPath);const b=await api('/backtest/latest',{even:E,odd:O},signal);if(seq!==requestSeq)return;const hits=new Set(b.hits||[]);const didWin=(b.hits_count||0)>=11;const shownGames=b.games_tested||p.suggestion.games||[];renderBalls('autoOfficial',b.official,hits);renderDerivedGames(shownGames);el('simulationCard').className=`card simulation-main ${didWin?'win':'neutral'}`;el('contestBadge').className='badge badge-blue';el('contestBadge').innerText=`Concurso ${b.contest}`;el('hitsMetric').innerText=b.hits_count;el('patternMetric').innerText=b.pattern;el('currentPattern').innerText=b.pattern;el('autoResult').innerHTML=`<div class="hit-display">${didWin?'&#9989;':'&bull;'} ${b.hits_count} acertos</div><div class="sim-badges"><span class="badge ${didWin?'badge-green':'badge-neutral'}">${b.hits_count} acertos</span><span class="badge badge-blue">Paridade ${b.pattern}</span><span class="badge badge-yellow">Concurso ${b.contest}</span></div>`;renderPlan(E,O,shownGames,rec.summary||{});setDone();}catch(err){if(err.name==='AbortError')return;setError(err.message||'Falha inesperada');}}
 document.addEventListener('DOMContentLoaded',()=>{el('selWindow').addEventListener('change',()=>loadAll(false));el('btnRefresh').addEventListener('click',()=>loadAll(true));loadAll(false);loadHistory();});
 </script>
 </body>
