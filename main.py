@@ -409,6 +409,87 @@ def select_balanced_numbers(
     return selected[:needed]
 
 
+def build_parity_suggestion_legacy(
+    draws: List[dict],
+    even_needed: int = 8,
+    odd_needed: int = 7
+) -> Dict[str, Any]:
+    try:
+        if not draws or len(draws) < 2:
+            return {
+                "even": [],
+                "odd": [],
+                "combo": [],
+                "parity": {"even_count": even_needed, "odd_count": odd_needed},
+                "pattern": f"{even_needed}-{odd_needed}",
+                "valid": False,
+                "rules": {"sum_ok": False, "repeat_ok": False},
+                "error": "Draws insuficientes para analise",
+            }
+
+        even_needed = max(0, min(15, even_needed))
+        odd_needed = max(0, min(15 - even_needed, odd_needed))
+        if even_needed + odd_needed != 15:
+            even_needed, odd_needed = 8, 7
+
+        last_draw = draws[0]["numbers"] if draws else []
+        trend = classify_trend(draws, window=20)
+        allowed = set(trend.get("hot", []) + trend.get("warm", []))
+
+        freq_all = frequencies(draws)
+        freq = [f for f in freq_all if f["n"] in allowed]
+        if not freq or len(freq) < 15:
+            freq = freq_all
+
+        ev_pool = [f for f in freq if f["n"] % 2 == 0]
+        od_pool = [f for f in freq if f["n"] % 2 == 1]
+
+        if even_needed > odd_needed:
+            ev = sorted(ev_pool, key=lambda x: (-x["count"], x["n"]))[:even_needed]
+            od = sorted(od_pool, key=lambda x: (x["count"], x["n"]))[:odd_needed]
+        elif odd_needed > even_needed:
+            ev = sorted(ev_pool, key=lambda x: (x["count"], x["n"]))[:even_needed]
+            od = sorted(od_pool, key=lambda x: (-x["count"], x["n"]))[:odd_needed]
+        else:
+            ev = sorted(ev_pool, key=lambda x: (-x["count"], x["n"]))[:even_needed]
+            od = sorted(od_pool, key=lambda x: (-x["count"], x["n"]))[:odd_needed]
+
+        if len(ev) < even_needed or len(od) < odd_needed:
+            sorted_all = sorted(freq_all, key=lambda x: (-x["count"], x["n"]))
+            ev = [f for f in sorted_all if f["n"] % 2 == 0][:even_needed]
+            od = [f for f in sorted_all if f["n"] % 2 == 1][:odd_needed]
+
+        combo = sorted([x["n"] for x in ev] + [x["n"] for x in od])
+        valid_sum_ok = valid_sum(combo)
+        valid_repeat_ok = limit_repetition(combo, last_draw, max_repeat=9)
+
+        return {
+            "even": [x["n"] for x in ev],
+            "odd": [x["n"] for x in od],
+            "combo": combo,
+            "parity": {"even_count": even_needed, "odd_count": odd_needed},
+            "pattern": f"{even_needed}-{odd_needed}",
+            "valid": valid_sum_ok and valid_repeat_ok,
+            "rules": {"sum_ok": valid_sum_ok, "repeat_ok": valid_repeat_ok},
+            "meta": {
+                "strategy": "legacy_frequency",
+                "draws_analyzed": len(draws),
+            },
+        }
+    except Exception as e:
+        return {
+            "even": [],
+            "odd": [],
+            "combo": [],
+            "parity": {"even_count": even_needed, "odd_count": odd_needed},
+            "pattern": f"{even_needed}-{odd_needed}",
+            "valid": False,
+            "rules": {"sum_ok": False, "repeat_ok": False},
+            "error": f"Erro interno: {str(e)}",
+            "meta": {"strategy": "legacy_frequency", "error": True},
+        }
+
+
 def build_parity_suggestion(
     draws: List[dict],
     even_needed: int = 8,
@@ -1392,6 +1473,117 @@ async def backtest_latest(
             "ok": False,
             "error": f"Erro interno: {str(e)}"
         }
+
+
+def compare_strategy_summary(rows: List[Dict[str, Any]], key: str) -> Dict[str, Any]:
+    hits = [r[key]["hits_count"] for r in rows]
+    if not hits:
+        return {
+            "average_hits": 0,
+            "max_hits": 0,
+            "min_hits": 0,
+            "games_11_plus": 0,
+            "games_12_plus": 0,
+            "games_13_plus": 0,
+        }
+
+    return {
+        "average_hits": round(sum(hits) / len(hits), 2),
+        "max_hits": max(hits),
+        "min_hits": min(hits),
+        "games_11_plus": sum(1 for h in hits if h >= 11),
+        "games_12_plus": sum(1 for h in hits if h >= 12),
+        "games_13_plus": sum(1 for h in hits if h >= 13),
+    }
+
+
+@app.get("/backtest/compare")
+async def backtest_compare(
+    limit: int = Query(30, ge=1, le=100),
+    even: int = Query(7, ge=0, le=15),
+    odd: int = Query(8, ge=0, le=15),
+    history: int = Query(50, ge=20, le=150),
+):
+    """
+    Compara a estrategia antiga contra a estrategia atual em concursos passados.
+
+    Para cada concurso testado, usa apenas concursos anteriores como historico,
+    evitando vazamento de resultado futuro.
+    """
+    even, odd = validate_parity(even, odd)
+    needed_draws = limit + history + 5
+    draws = await collect_last_n(needed_draws)
+
+    if len(draws) < history + 1:
+        return {
+            "ok": False,
+            "error": f"Historico insuficiente: {len(draws)} concursos coletados",
+            "required_minimum": history + 1,
+        }
+
+    rows: List[Dict[str, Any]] = []
+    max_index = min(limit, len(draws) - history)
+
+    for idx in range(max_index):
+        target = draws[idx]
+        past_draws = draws[idx + 1:idx + 1 + history]
+        official = sorted(target.get("numbers", []))
+
+        legacy_suggestion = build_parity_suggestion_legacy(
+            past_draws,
+            even_needed=even,
+            odd_needed=odd,
+        )
+        balanced_suggestion = build_parity_suggestion(
+            past_draws,
+            even_needed=even,
+            odd_needed=odd,
+        )
+
+        legacy_combo = sorted(legacy_suggestion.get("combo", []))
+        balanced_combo = sorted(balanced_suggestion.get("combo", []))
+        legacy_hits = sorted(set(legacy_combo) & set(official))
+        balanced_hits = sorted(set(balanced_combo) & set(official))
+
+        rows.append({
+            "contest": target.get("contest"),
+            "date": target.get("date"),
+            "official": official,
+            "legacy": {
+                "strategy": "legacy_frequency",
+                "suggested": legacy_combo,
+                "hits": legacy_hits,
+                "hits_count": len(legacy_hits),
+                "valid": legacy_suggestion.get("valid", False),
+            },
+            "balanced": {
+                "strategy": "balanced_score_v2",
+                "suggested": balanced_combo,
+                "hits": balanced_hits,
+                "hits_count": len(balanced_hits),
+                "valid": balanced_suggestion.get("valid", False),
+                "band_profile": balanced_suggestion.get("meta", {}).get("band_profile"),
+            },
+            "delta": len(balanced_hits) - len(legacy_hits),
+        })
+
+    return {
+        "ok": True,
+        "pattern": f"{even}-{odd}",
+        "requested_limit": limit,
+        "compared_games": len(rows),
+        "history_per_game": history,
+        "summary": {
+            "legacy": compare_strategy_summary(rows, "legacy"),
+            "balanced": compare_strategy_summary(rows, "balanced"),
+            "balanced_better": sum(1 for r in rows if r["delta"] > 0),
+            "legacy_better": sum(1 for r in rows if r["delta"] < 0),
+            "same": sum(1 for r in rows if r["delta"] == 0),
+            "total_delta": sum(r["delta"] for r in rows),
+        },
+        "results": rows,
+        "updated_at": dt.datetime.now(BRT).strftime("%d/%m/%Y %H:%M:%S"),
+    }
 
 
 @app.get("/debug/backtest")
