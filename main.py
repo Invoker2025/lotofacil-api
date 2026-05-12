@@ -317,6 +317,30 @@ def number_gap(draws: List[dict], n: int) -> int:
     return len(draws) + 1
 
 
+def percentage_system_numbers(draws: List[dict]) -> Dict[int, Dict[str, Any]]:
+    """
+    Regra pratica inspirada no sistema de porcentagem do Livro Negro.
+
+    No livro, a regra original usa pelo menos 2 aparicoes nos ultimos 10
+    concursos e 1 nos ultimos 5. Na Lotofacil saem 15 de 25 dezenas por
+    concurso, entao esse corte fica permissivo demais. Aqui usamos um corte
+    adaptado: pelo menos 6 aparicoes nos ultimos 10 e 3 nos ultimos 5.
+    """
+    last_10 = draws[:min(10, len(draws))]
+    last_5 = draws[:min(5, len(draws))]
+
+    out: Dict[int, Dict[str, Any]] = {}
+    for n in range(1, 26):
+        count_10 = sum(1 for d in last_10 if n in set(d.get("numbers", [])))
+        count_5 = sum(1 for d in last_5 if n in set(d.get("numbers", [])))
+        out[n] = {
+            "last_10": count_10,
+            "last_5": count_5,
+            "qualified": count_10 >= 6 and count_5 >= 3,
+        }
+    return out
+
+
 def band_targets(needed: int, parity: str) -> Dict[str, int]:
     if needed <= 0:
         return {"low": 0, "mid": 0, "high": 0}
@@ -349,13 +373,18 @@ def build_number_scores(
 
     long_counts = {f["n"]: f["count"] for f in frequencies(draws)}
     recent_counts = {f["n"]: f["count"] for f in frequencies(recent)}
+    percentage_profile = percentage_system_numbers(draws)
 
     out = []
     for n in range(1, 26):
         gap = number_gap(draws, n)
+        pct_info = percentage_profile[n]
         long_score = (long_counts.get(n, 0) / total) * 42
         recent_score = (recent_counts.get(n, 0) / recent_total) * 34
         repeat_score = 8 if n in last_draw else 0
+        # Mantido como indicador auditavel. No backtest, usar isso como boost
+        # direto piorou a media recente da Lotofacil, entao nao altera o score.
+        percentage_score = 0
         if 1 <= gap <= 4:
             gap_score = 8
         elif gap == 0:
@@ -368,11 +397,14 @@ def build_number_scores(
             gap_score = 0
 
         trend_score = 4 if n in hot else 6 if n in warm else 1 if n in cold else 0
-        score = long_score + recent_score + repeat_score + gap_score + trend_score
+        score = long_score + recent_score + repeat_score + gap_score + trend_score + percentage_score
         out.append({
             "n": n,
             "count": long_counts.get(n, 0),
             "recent_count": recent_counts.get(n, 0),
+            "last_10_count": pct_info["last_10"],
+            "last_5_count": pct_info["last_5"],
+            "percentage_qualified": pct_info["qualified"],
             "gap": gap,
             "band": number_band(n),
             "score": round(score, 4),
@@ -407,6 +439,226 @@ def select_balanced_numbers(
                 break
 
     return selected[:needed]
+
+
+def intelligent_exclusions(
+    scored: List[Dict[str, Any]],
+    combo: List[int],
+    count: int = 3
+) -> Dict[str, Any]:
+    combo_set = set(combo)
+    candidates = [x for x in scored if x["n"] not in combo_set]
+
+    ranked = sorted(
+        candidates,
+        key=lambda x: (
+            x["score"],
+            x["recent_count"],
+            x["count"],
+            -x["gap"],
+            x["n"],
+        )
+    )
+    picked = ranked[:count]
+
+    return {
+        "exclude_2": [x["n"] for x in picked[:2]],
+        "exclude_3": [x["n"] for x in picked[:3]],
+        "candidates": [
+            {
+                "n": x["n"],
+                "score": x["score"],
+                "recent_count": x["recent_count"],
+                "last_10_count": x.get("last_10_count"),
+                "last_5_count": x.get("last_5_count"),
+                "gap": x["gap"],
+            }
+            for x in picked
+        ],
+        "rule": "menor score fora da combinacao principal",
+    }
+
+
+def build_derived_games(
+    scored: List[Dict[str, Any]],
+    combo: List[int],
+    even_needed: int,
+    odd_needed: int,
+    exclusions: Optional[List[int]] = None,
+    total_games: int = 6,
+) -> List[Dict[str, Any]]:
+    score_by_n = {x["n"]: x for x in scored}
+    primary = sorted(combo)
+    exclude_set = set(exclusions or [])
+
+    games: List[Dict[str, Any]] = [{
+        "index": 1,
+        "role": "principal",
+        "numbers": primary,
+        "pattern": f"{even_needed}-{odd_needed}",
+        "sum": sum(primary),
+        "valid": valid_15_unique(primary) and valid_sum(primary),
+        "changed_out": [],
+        "changed_in": [],
+    }]
+
+    selected = set(primary)
+    selected_even = sorted(
+        [n for n in primary if n % 2 == 0],
+        key=lambda n: (score_by_n.get(n, {}).get("score", 0), n)
+    )
+    selected_odd = sorted(
+        [n for n in primary if n % 2 == 1],
+        key=lambda n: (score_by_n.get(n, {}).get("score", 0), n)
+    )
+
+    alt_even = sorted(
+        [x["n"] for x in scored if x["n"] % 2 == 0 and x["n"] not in selected and x["n"] not in exclude_set],
+        key=lambda n: (-score_by_n[n]["score"], -score_by_n[n]["recent_count"], n)
+    )
+    alt_odd = sorted(
+        [x["n"] for x in scored if x["n"] % 2 == 1 and x["n"] not in selected and x["n"] not in exclude_set],
+        key=lambda n: (-score_by_n[n]["score"], -score_by_n[n]["recent_count"], n)
+    )
+
+    swap_templates = [
+        (1, 0),
+        (0, 1),
+        (1, 1),
+        (2, 1),
+        (1, 2),
+    ]
+
+    seen = {tuple(primary)}
+    for even_swaps, odd_swaps in swap_templates:
+        if len(games) >= total_games:
+            break
+        if len(selected_even) < even_swaps or len(alt_even) < even_swaps:
+            continue
+        if len(selected_odd) < odd_swaps or len(alt_odd) < odd_swaps:
+            continue
+
+        out_even = selected_even[:even_swaps]
+        out_odd = selected_odd[:odd_swaps]
+        in_even = alt_even[:even_swaps]
+        in_odd = alt_odd[:odd_swaps]
+
+        candidate = sorted((selected - set(out_even) - set(out_odd)) | set(in_even) | set(in_odd))
+        key = tuple(candidate)
+        if key in seen or not valid_15_unique(candidate):
+            continue
+
+        seen.add(key)
+        games.append({
+            "index": len(games) + 1,
+            "role": "derivado",
+            "numbers": candidate,
+            "pattern": f"{even_needed}-{odd_needed}",
+            "sum": sum(candidate),
+            "valid": valid_sum(candidate),
+            "changed_out": sorted(out_even + out_odd),
+            "changed_in": sorted(in_even + in_odd),
+        })
+
+    return games
+
+
+def consecutive_profile(numbers: List[int]) -> Dict[str, Any]:
+    nums = sorted(numbers)
+    groups: List[List[int]] = []
+    current: List[int] = []
+
+    for n in nums:
+        if not current or n == current[-1] + 1:
+            current.append(n)
+        else:
+            if len(current) >= 2:
+                groups.append(current)
+            current = [n]
+
+    if len(current) >= 2:
+        groups.append(current)
+
+    max_run = max((len(g) for g in groups), default=1)
+    return {
+        "groups": groups,
+        "groups_count": len(groups),
+        "max_run": max_run,
+        "has_long_run": max_run >= 5,
+        "status": "attention" if max_run >= 5 else "ok",
+    }
+
+
+def explain_ranked_numbers(scored: List[Dict[str, Any]], combo: List[int]) -> Dict[str, Any]:
+    selected = set(combo)
+    ranked = sorted(scored, key=lambda x: (-x["score"], -x["recent_count"], -x["count"], x["n"]))
+
+    def item(x: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "n": x["n"],
+            "score": x["score"],
+            "status": "selecionada" if x["n"] in selected else "fora",
+            "parity": "par" if x["n"] % 2 == 0 else "impar",
+            "band": x["band"],
+            "long_count": x["count"],
+            "recent_count": x["recent_count"],
+            "last_10_count": x.get("last_10_count"),
+            "last_5_count": x.get("last_5_count"),
+            "gap": x["gap"],
+            "percentage_qualified": x.get("percentage_qualified", False),
+        }
+
+    return {
+        "strong": [item(x) for x in ranked[:8]],
+        "selected": [item(x) for x in ranked if x["n"] in selected],
+        "risk": [item(x) for x in sorted(scored, key=lambda x: (x["score"], x["recent_count"], x["count"], x["n"]))[:8]],
+    }
+
+
+def apply_weight_profile(scored: List[Dict[str, Any]], profile: Dict[str, float]) -> List[Dict[str, Any]]:
+    out = []
+    for x in scored:
+        gap = x["gap"]
+        if 1 <= gap <= 4:
+            gap_signal = 1.0
+        elif 5 <= gap <= 9:
+            gap_signal = 0.5
+        elif gap >= 14:
+            gap_signal = -0.5
+        else:
+            gap_signal = 0.0
+
+        weighted_score = (
+            x["count"] * profile.get("long", 1.0)
+            + x["recent_count"] * profile.get("recent", 1.0)
+            + (1 if gap <= 4 else 0) * profile.get("recency", 1.0)
+            + gap_signal * profile.get("gap", 1.0)
+            + (1 if x.get("percentage_qualified") else 0) * profile.get("percentage", 0.0)
+        )
+        y = x.copy()
+        y["score"] = round(weighted_score, 4)
+        out.append(y)
+    return out
+
+
+def build_weighted_suggestion(
+    draws: List[dict],
+    even_needed: int,
+    odd_needed: int,
+    profile: Dict[str, float]
+) -> Dict[str, Any]:
+    trend = classify_trend(draws, window=20)
+    base = build_number_scores(draws, trend.get("hot", []), trend.get("warm", []), trend.get("cold", []))
+    scored = apply_weight_profile(base, profile)
+    ev = select_balanced_numbers(scored, even_needed, "even")
+    od = select_balanced_numbers(scored, odd_needed, "odd")
+    combo = sorted([x["n"] for x in ev] + [x["n"] for x in od])
+    return {
+        "combo": combo,
+        "pattern": f"{even_needed}-{odd_needed}",
+        "valid": valid_15_unique(combo) and valid_sum(combo),
+        "meta": {"weight_profile": profile},
+    }
 
 
 def build_parity_suggestion_legacy(
@@ -571,6 +823,7 @@ def build_parity_suggestion(
 
         valid_sum_ok = valid_sum(combo)
         valid_repeat_ok = limit_repetition(combo, last_draw, max_repeat=9)
+        consecutive = consecutive_profile(combo)
         valid = valid_sum_ok and valid_repeat_ok
 
         band_profile = {
@@ -585,11 +838,26 @@ def build_parity_suggestion(
                 "high": sum(1 for x in od if x["band"] == "high"),
             },
         }
+        percentage_pool = sorted(x["n"] for x in scored if x.get("percentage_qualified"))
+        exclusions = intelligent_exclusions(scored, combo, count=3)
+        derived_games = build_derived_games(
+            scored,
+            combo,
+            even_needed,
+            odd_needed,
+            exclusions=exclusions["exclude_3"],
+            total_games=6,
+        )
+        for game in derived_games:
+            game["consecutive"] = consecutive_profile(game.get("numbers", []))
+        number_ranking = explain_ranked_numbers(scored, combo)
 
         return {
             "even": [x["n"] for x in ev],
             "odd":  [x["n"] for x in od],
             "combo": combo,
+            "exclusions": exclusions,
+            "games": derived_games,
             "parity": {
                 "even_count": even_needed,
                 "odd_count": odd_needed
@@ -598,7 +866,8 @@ def build_parity_suggestion(
             "valid": valid,
             "rules": {
                 "sum_ok": valid_sum_ok,
-                "repeat_ok": valid_repeat_ok
+                "repeat_ok": valid_repeat_ok,
+                "consecutive": consecutive
             },
             "meta": {
                 "hot_count": len(hot),
@@ -606,7 +875,14 @@ def build_parity_suggestion(
                 "cold_count": len(cold),
                 "draws_analyzed": len(draws),
                 "strategy": "balanced_score_v2",
-                "band_profile": band_profile
+                "derived_games_count": len(derived_games),
+                "number_ranking": number_ranking,
+                "band_profile": band_profile,
+                "percentage_system": {
+                    "qualified_numbers": percentage_pool,
+                    "selected_qualified": sorted(n for n in combo if n in set(percentage_pool)),
+                    "rule": "last_10>=6 and last_5>=3"
+                }
             }
         }
 
@@ -1212,8 +1488,10 @@ button:disabled{opacity:.6;cursor:not-allowed}
 .history-meta{display:grid;gap:3px}.history-contest{font-weight:800}.history-date{color:var(--muted);font-size:12px}
 .history-numbers{display:flex;gap:5px;flex-wrap:wrap}.ball.small{width:28px;height:28px;font-size:12px;border-width:1px}
 .history-pattern{justify-self:center}
+.derived-list{display:grid;gap:10px}.derived-card{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:10px;display:grid;gap:8px}.derived-head{display:flex;justify-content:space-between;gap:8px;align-items:center}.derived-title{font-weight:800}.derived-meta{display:flex;gap:6px;flex-wrap:wrap}.exclusion-line{margin-top:12px;color:var(--muted);font-size:13px}
+.lab-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}.lab-box{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:10px}.lab-box span{display:block;color:var(--muted);font-size:11px;font-weight:800;text-transform:uppercase}.lab-box strong{display:block;margin-top:4px;font-size:18px}.rank-list{display:flex;gap:6px;flex-wrap:wrap;margin-top:10px}
 .loading-text{color:var(--muted);font-size:13px}
-@media(max-width:768px){.main-stack{gap:12px}.simulation-main{order:1}.tested-card{order:2}.official-card{order:3}.suggestion-card{order:4}.history-section{order:5}.simulation-head{display:block}.hit-display{font-size:26px}.sim-badges{gap:6px}.sim-legend{margin-top:12px}.history-card{grid-template-columns:1fr;gap:8px;padding:12px}.history-pattern{justify-self:start}.history-numbers{gap:4px}.ball.small{width:26px;height:26px;font-size:11px}}
+@media(max-width:768px){.main-stack{gap:12px}.simulation-main{order:1}.tested-card{order:2}.official-card{order:3}.suggestion-card{order:4}.derived-section{order:5}.lab-section{order:6}.history-section{order:7}.simulation-head{display:block}.hit-display{font-size:26px}.sim-badges{gap:6px}.sim-legend{margin-top:12px}.history-card{grid-template-columns:1fr;gap:8px;padding:12px}.history-pattern{justify-self:start}.history-numbers{gap:4px}.ball.small{width:26px;height:26px;font-size:11px}.lab-grid{grid-template-columns:1fr}}
 @media(min-width:769px) and (max-width:980px){.history-card{grid-template-columns:96px minmax(0,1fr) 58px}}
 @media(max-width:380px){.hit-display{font-size:24px}.ball.small{width:25px;height:25px;font-size:10px}}
 </style>
@@ -1229,6 +1507,8 @@ button:disabled{opacity:.6;cursor:not-allowed}
       <div id="simulationCard" class="card simulation-main neutral"><div class="simulation-head"><div class="title">Simulação automática</div><span id="contestBadge" class="badge badge-blue">Último concurso</span></div><div id="autoResult" class="result-line"><div class="loading-text">Executando backtest...</div></div><div class="legend sim-legend"><div class="legend-item"><span class="dot even"></span>Par</div><div class="legend-item"><span class="dot odd"></span>Ímpar</div><div class="legend-item"><span class="dot hit"></span>Acerto</div></div></div>
       <div class="split"><div class="card tested-card"><div class="title">Sugestão testada</div><div id="autoSuggested" class="balls"></div></div><div class="card official-card"><div class="title">Resultado oficial</div><div id="autoOfficial" class="balls"></div></div></div>
       <div class="card suggestion-card"><div class="title">Combinação sugerida <span id="suggestionPattern" class="pill">-</span></div><div id="suggBalls" class="balls"></div></div>
+      <div class="card derived-section"><div class="title">Jogos derivados <span id="derivedStatus" class="badge badge-neutral">-</span></div><div id="derivedList" class="derived-list"><div class="loading-text">Aguardando sugestão...</div></div><div id="exclusionLine" class="exclusion-line"></div></div>
+      <div class="card lab-section"><div class="title">Laboratório <span id="labStatus" class="badge badge-neutral">Aguardando</span></div><div id="labContent" class="loading-text">Análise histórica será carregada após a sugestão.</div></div>
       <div class="card history-section"><div class="title">Últimos 10 concursos oficiais <span id="historyStatus" class="badge badge-neutral">Carregando</span></div><div id="historyList" class="history-list"><div class="loading-text">Carregando últimos concursos...</div></div></div>
     </main>
   </div>
@@ -1248,12 +1528,16 @@ function finishEvenEdit(){if(el('inpEven').value==='')el('inpEven').value='8';co
 function finishOddEdit(){if(el('inpOdd').value==='')el('inpOdd').value='7';const O=clampParityValue(el('inpOdd').value,7);el('inpOdd').value=O;el('inpEven').value=15-O;updatePattern(15-O,O);}
 function readParity(){let E=clampParityValue(el('inpEven').value,8);let O=clampParityValue(el('inpOdd').value,15-E);if(E+O!==15)O=15-E;el('inpEven').value=E;el('inpOdd').value=O;updatePattern(E,O);return{E,O};}
 function renderBalls(targetId,numbers,hits=new Set()){el(targetId).innerHTML=(numbers||[]).map(n=>{const parityClass=n%2===0?'even':'odd';const hitClass=hits.has(n)?' hit':'';return `<div class="ball ${parityClass}${hitClass}" title="Dezena ${pad(n)}">${pad(n)}</div>`}).join('');}
-function setLoading(E,O){el('requestStatus').innerText=`Atualizando ${E}-${O}...`;el('suggBalls').innerHTML='<div class="loading-text">Atualizando sugestão...</div>';el('autoSuggested').innerHTML='';el('autoOfficial').innerHTML='';el('autoResult').innerHTML='<div class="loading-text">Executando backtest...</div>';el('hitsMetric').innerText='-';el('simulationCard').className='card simulation-main neutral';el('btnRefresh').disabled=true;el('btnRefresh').innerText='Atualizando...';}
+function setLoading(E,O){el('requestStatus').innerText=`Atualizando ${E}-${O}...`;el('suggBalls').innerHTML='<div class="loading-text">Atualizando sugestão...</div>';el('derivedList').innerHTML='<div class="loading-text">Gerando jogos derivados...</div>';el('derivedStatus').innerText='...';el('exclusionLine').innerText='';el('autoSuggested').innerHTML='';el('autoOfficial').innerHTML='';el('autoResult').innerHTML='<div class="loading-text">Executando backtest...</div>';el('hitsMetric').innerText='-';el('simulationCard').className='card simulation-main neutral';el('btnRefresh').disabled=true;el('btnRefresh').innerText='Atualizando...';}
 function setDone(){el('requestStatus').innerText='Dados atualizados';el('btnRefresh').disabled=false;el('btnRefresh').innerText='Atualizar';}
 function setError(message){el('requestStatus').innerText='Erro ao atualizar';el('autoResult').innerHTML=`<span class="error">${message}</span>`;el('btnRefresh').disabled=false;el('btnRefresh').innerText='Atualizar';}
+function renderInlineBalls(numbers,hits=new Set()){return (numbers||[]).map(n=>`<span class="ball small ${n%2===0?'even':'odd'}${hits.has(n)?' hit':''}">${pad(n)}</span>`).join('');}
+function renderDerivedGames(games=[],exclusions=null){const list=games.slice(0,6);el('derivedStatus').innerText=`${list.length} jogos`;el('derivedList').innerHTML=list.map(g=>{const hits=new Set(g.hits||[]);const hitBadge=Number.isInteger(g.hits_count)?`<span class="badge ${g.hits_count>=11?'badge-green':'badge-neutral'}">${g.hits_count} acertos</span>`:'';const changes=(g.changed_in||[]).length?`<span class="badge badge-blue">Entram ${(g.changed_in||[]).map(pad).join('-')}</span><span class="badge badge-neutral">Saem ${(g.changed_out||[]).map(pad).join('-')}</span>`:'<span class="badge badge-yellow">Principal</span>';return `<div class="derived-card"><div class="derived-head"><div class="derived-title">Jogo ${g.index}</div><div class="derived-meta">${hitBadge}<span class="badge badge-blue">${g.pattern}</span>${changes}</div></div><div class="history-numbers">${renderInlineBalls(g.numbers,hits)}</div></div>`}).join('')||'<div class="loading-text">Nenhum jogo derivado disponível.</div>';const ex3=exclusions?.exclude_3||[];el('exclusionLine').innerText=ex3.length?`Exclusão sugerida: ${ex3.map(pad).join(', ')}`:'';}
+function renderRanking(ranking){const strong=(ranking?.strong||[]).slice(0,8).map(x=>`<span class="badge badge-blue">${pad(x.n)} · ${Math.round(x.score)}</span>`).join('');const risk=(ranking?.risk||[]).slice(0,6).map(x=>`<span class="badge badge-neutral">${pad(x.n)} · ${Math.round(x.score)}</span>`).join('');return `<div class="rank-list">${strong}</div><div class="exclusion-line">Em risco: ${risk||'-'}</div>`;}
+async function loadLab(E,O,ranking){el('labStatus').innerText='Calculando';el('labContent').innerHTML='<div class="loading-text">Rodando laboratório histórico...</div>';try{const [derived,opt]=await Promise.all([api('/backtest/derived',{limit:30,even:E,odd:O,history:50}),api('/optimizer/weights',{limit:30,even:E,odd:O,history:50})]);const s=derived.summary||{};const best=opt.best_profile||{};el('labStatus').innerText='Atualizado';el('labContent').innerHTML=`<div class="lab-grid"><div class="lab-box"><span>Principal médio</span><strong>${s.principal_average??'-'}</strong></div><div class="lab-box"><span>Melhor conjunto</span><strong>${s.best_set_average??'-'}</strong></div><div class="lab-box"><span>Perfil vencedor</span><strong>${best.profile?.name||'-'}</strong></div></div><div class="sim-badges" style="margin-top:10px"><span class="badge badge-green">Derivados melhoraram ${s.derived_improved_games??0}</span><span class="badge badge-blue">11+ no conjunto ${s.best_set_11_plus??0}</span><span class="badge badge-yellow">12+ no conjunto ${s.best_set_12_plus??0}</span></div>${renderRanking(ranking)}`;}catch(err){el('labStatus').innerText='Erro';el('labContent').innerHTML=`<span class="error">${err.message||'Falha no laboratório'}</span>`;}}
 function renderHistory(draws){el('historyList').innerHTML=(draws||[]).map(d=>{const nums=d.numbers||[];const even=d.even_count??nums.filter(n=>n%2===0).length;const odd=d.odd_count??nums.filter(n=>n%2===1).length;const balls=nums.map(n=>`<span class="ball small ${n%2===0?'even':'odd'}">${pad(n)}</span>`).join('');return `<div class="history-card"><div class="history-meta"><div class="history-contest">Concurso ${d.contest}</div><div class="history-date">${d.date||'-'}</div></div><div class="history-numbers">${balls}</div><div class="history-pattern badge badge-blue">${even}-${odd}</div></div>`}).join('');}
 async function loadHistory(){el('historyStatus').innerText='Carregando';el('historyList').innerHTML='<div class="loading-text">Carregando últimos concursos...</div>';try{const data=await api('/lotofacil',{limit:10});renderHistory(data.results||[]);el('historyStatus').innerText=`${data.count||0} jogos`;}catch(err){el('historyStatus').innerText='Erro';el('historyList').innerHTML=`<span class="error">${err.message||'Falha ao carregar histórico'}</span>`;}}
-async function loadAll(force=false){const seq=++requestSeq;if(activeController)activeController.abort();activeController=new AbortController();const signal=activeController.signal;const {E,O}=readParity();const w=el('selWindow').value;setLoading(E,O);try{const p=await api('/parity',{window:w,even:E,odd:O,...(force?{force:true}:{})},signal);if(seq!==requestSeq)return;renderBalls('suggBalls',p.suggestion.combo);el('suggestionPattern').innerText=p.pattern||p.suggestion.pattern||`${E}-${O}`;el('gamesMetric').innerText=p.considered_games??'-';el('autoResult').innerHTML='<div class="loading-text">Executando backtest...</div>';const backtestPath=`/backtest/latest?even=${E}&odd=${O}`;console.log('[APP] Backtest:',backtestPath);const b=await api('/backtest/latest',{even:E,odd:O},signal);if(seq!==requestSeq)return;const hits=new Set(b.hits||[]);const didWin=(b.hits_count||0)>=11;renderBalls('autoSuggested',b.suggested,hits);renderBalls('autoOfficial',b.official,hits);el('simulationCard').className=`card simulation-main ${didWin?'win':'neutral'}`;el('contestBadge').className='badge badge-blue';el('contestBadge').innerText=`Concurso ${b.contest}`;el('hitsMetric').innerText=b.hits_count;el('patternMetric').innerText=b.pattern;el('currentPattern').innerText=b.pattern;el('autoResult').innerHTML=`<div class="hit-display">${didWin?'&#9989;':'&bull;'} ${b.hits_count} acertos</div><div class="sim-badges"><span class="badge ${didWin?'badge-green':'badge-neutral'}">${b.hits_count} acertos</span><span class="badge badge-blue">Paridade ${b.pattern}</span><span class="badge badge-yellow">Concurso ${b.contest}</span></div>`;setDone();}catch(err){if(err.name==='AbortError')return;setError(err.message||'Falha inesperada');}}
+async function loadAll(force=false){const seq=++requestSeq;if(activeController)activeController.abort();activeController=new AbortController();const signal=activeController.signal;const {E,O}=readParity();const w=el('selWindow').value;setLoading(E,O);try{const p=await api('/parity',{window:w,even:E,odd:O,...(force?{force:true}:{})},signal);if(seq!==requestSeq)return;renderBalls('suggBalls',p.suggestion.combo);renderDerivedGames(p.suggestion.games||[],p.suggestion.exclusions);el('suggestionPattern').innerText=p.pattern||p.suggestion.pattern||`${E}-${O}`;el('gamesMetric').innerText=p.considered_games??'-';el('autoResult').innerHTML='<div class="loading-text">Executando backtest...</div>';const backtestPath=`/backtest/latest?even=${E}&odd=${O}`;console.log('[APP] Backtest:',backtestPath);const b=await api('/backtest/latest',{even:E,odd:O},signal);if(seq!==requestSeq)return;const hits=new Set(b.hits||[]);const didWin=(b.hits_count||0)>=11;renderBalls('autoSuggested',b.suggested,hits);renderBalls('autoOfficial',b.official,hits);renderDerivedGames(b.games_tested||p.suggestion.games||[],b.exclusions||p.suggestion.exclusions);el('simulationCard').className=`card simulation-main ${didWin?'win':'neutral'}`;el('contestBadge').className='badge badge-blue';el('contestBadge').innerText=`Concurso ${b.contest}`;el('hitsMetric').innerText=b.hits_count;el('patternMetric').innerText=b.pattern;el('currentPattern').innerText=b.pattern;el('autoResult').innerHTML=`<div class="hit-display">${didWin?'&#9989;':'&bull;'} ${b.hits_count} acertos</div><div class="sim-badges"><span class="badge ${didWin?'badge-green':'badge-neutral'}">${b.hits_count} acertos</span><span class="badge badge-blue">Paridade ${b.pattern}</span><span class="badge badge-yellow">Concurso ${b.contest}</span></div>`;setDone();loadLab(E,O,p.suggestion.meta?.number_ranking);}catch(err){if(err.name==='AbortError')return;setError(err.message||'Falha inesperada');}}
 document.addEventListener('DOMContentLoaded',()=>{el('inpEven').addEventListener('input',()=>cleanNumericInput('inpEven'));el('inpOdd').addEventListener('input',()=>cleanNumericInput('inpOdd'));el('inpEven').addEventListener('blur',()=>{finishEvenEdit();loadAll(false);});el('inpOdd').addEventListener('blur',()=>{finishOddEdit();loadAll(false);});el('selWindow').addEventListener('change',()=>loadAll(false));el('btnRefresh').addEventListener('click',()=>loadAll(true));loadAll(false);loadHistory();});
 </script>
 </body>
@@ -1441,6 +1725,15 @@ async def backtest_latest(
 
         # 5. Calcular acertos
         hits = sorted(set(suggested_numbers) & set(official_numbers))
+        derived_results = []
+        for game in suggestion.get("games", []):
+            game_numbers = game.get("numbers", [])
+            game_hits = sorted(set(game_numbers) & set(official_numbers))
+            derived_results.append({
+                **game,
+                "hits": game_hits,
+                "hits_count": len(game_hits),
+            })
 
         logger.info(
             f"[BACKTEST] Resultado: {len(hits)} acertos no concurso {latest_contest}")
@@ -1453,6 +1746,9 @@ async def backtest_latest(
             "official": official_numbers,
             "hits": hits,
             "hits_count": len(hits),
+            "games_tested": derived_results,
+            "best_game": max(derived_results, key=lambda g: g["hits_count"]) if derived_results else None,
+            "exclusions": suggestion.get("exclusions"),
             "pattern": suggestion.get("pattern", ""),
             "parity": suggestion.get("parity", {}),
             "valid": suggestion.get("valid", False),
@@ -1582,6 +1878,142 @@ async def backtest_compare(
             "total_delta": sum(r["delta"] for r in rows),
         },
         "results": rows,
+        "updated_at": dt.datetime.now(BRT).strftime("%d/%m/%Y %H:%M:%S"),
+    }
+
+
+@app.get("/backtest/derived")
+async def backtest_derived(
+    limit: int = Query(30, ge=1, le=100),
+    even: int = Query(7, ge=0, le=15),
+    odd: int = Query(8, ge=0, le=15),
+    history: int = Query(50, ge=20, le=150),
+):
+    even, odd = validate_parity(even, odd)
+    draws = await collect_last_n(limit + history + 5)
+
+    if len(draws) < history + 1:
+        return {
+            "ok": False,
+            "error": f"Historico insuficiente: {len(draws)} concursos coletados",
+            "required_minimum": history + 1,
+        }
+
+    rows: List[Dict[str, Any]] = []
+    max_index = min(limit, len(draws) - history)
+    for idx in range(max_index):
+        target = draws[idx]
+        past_draws = draws[idx + 1:idx + 1 + history]
+        official = sorted(target.get("numbers", []))
+        suggestion = build_parity_suggestion(past_draws, even, odd)
+        tested = []
+
+        for game in suggestion.get("games", []):
+            numbers = game.get("numbers", [])
+            hits = sorted(set(numbers) & set(official))
+            tested.append({
+                "index": game.get("index"),
+                "role": game.get("role"),
+                "numbers": numbers,
+                "hits": hits,
+                "hits_count": len(hits),
+                "changed_out": game.get("changed_out", []),
+                "changed_in": game.get("changed_in", []),
+                "consecutive": game.get("consecutive"),
+            })
+
+        best = max(tested, key=lambda g: g["hits_count"]) if tested else None
+        principal = tested[0] if tested else None
+        rows.append({
+            "contest": target.get("contest"),
+            "date": target.get("date"),
+            "official": official,
+            "exclusions": suggestion.get("exclusions"),
+            "principal": principal,
+            "best_game": best,
+            "games": tested,
+            "best_delta": (best["hits_count"] - principal["hits_count"]) if best and principal else 0,
+        })
+
+    principal_hits = [r["principal"]["hits_count"] for r in rows if r.get("principal")]
+    best_hits = [r["best_game"]["hits_count"] for r in rows if r.get("best_game")]
+    improved = sum(1 for r in rows if r.get("best_delta", 0) > 0)
+
+    return {
+        "ok": True,
+        "pattern": f"{even}-{odd}",
+        "compared_games": len(rows),
+        "history_per_game": history,
+        "summary": {
+            "principal_average": round(sum(principal_hits) / len(principal_hits), 2) if principal_hits else 0,
+            "best_set_average": round(sum(best_hits) / len(best_hits), 2) if best_hits else 0,
+            "principal_11_plus": sum(1 for h in principal_hits if h >= 11),
+            "best_set_11_plus": sum(1 for h in best_hits if h >= 11),
+            "best_set_12_plus": sum(1 for h in best_hits if h >= 12),
+            "derived_improved_games": improved,
+            "derived_same_games": sum(1 for r in rows if r.get("best_delta", 0) == 0),
+            "total_best_delta": sum(r.get("best_delta", 0) for r in rows),
+        },
+        "results": rows,
+        "updated_at": dt.datetime.now(BRT).strftime("%d/%m/%Y %H:%M:%S"),
+    }
+
+
+@app.get("/optimizer/weights")
+async def optimizer_weights(
+    limit: int = Query(30, ge=10, le=80),
+    even: int = Query(7, ge=0, le=15),
+    odd: int = Query(8, ge=0, le=15),
+    history: int = Query(50, ge=20, le=120),
+):
+    even, odd = validate_parity(even, odd)
+    draws = await collect_last_n(limit + history + 5)
+
+    if len(draws) < history + 1:
+        return {
+            "ok": False,
+            "error": f"Historico insuficiente: {len(draws)} concursos coletados",
+            "required_minimum": history + 1,
+        }
+
+    profiles = [
+        {"name": "baseline", "long": 1.0, "recent": 1.0, "recency": 1.0, "gap": 1.0, "percentage": 0.0},
+        {"name": "recent_plus", "long": 0.8, "recent": 1.4, "recency": 1.2, "gap": 0.8, "percentage": 0.0},
+        {"name": "long_plus", "long": 1.4, "recent": 0.8, "recency": 0.8, "gap": 1.0, "percentage": 0.0},
+        {"name": "gap_soft", "long": 1.0, "recent": 1.0, "recency": 1.0, "gap": 1.8, "percentage": 0.0},
+        {"name": "percentage_soft", "long": 1.0, "recent": 1.0, "recency": 1.0, "gap": 1.0, "percentage": 2.0},
+        {"name": "balanced_recent", "long": 1.1, "recent": 1.25, "recency": 1.0, "gap": 1.0, "percentage": 0.5},
+    ]
+
+    results = []
+    max_index = min(limit, len(draws) - history)
+    for profile in profiles:
+        hits_list = []
+        for idx in range(max_index):
+            target = draws[idx]
+            past_draws = draws[idx + 1:idx + 1 + history]
+            suggestion = build_weighted_suggestion(past_draws, even, odd, profile)
+            hits_list.append(len(set(suggestion["combo"]) & set(target.get("numbers", []))))
+
+        results.append({
+            "profile": profile,
+            "average_hits": round(sum(hits_list) / len(hits_list), 2) if hits_list else 0,
+            "max_hits": max(hits_list) if hits_list else 0,
+            "min_hits": min(hits_list) if hits_list else 0,
+            "games_11_plus": sum(1 for h in hits_list if h >= 11),
+            "games_12_plus": sum(1 for h in hits_list if h >= 12),
+            "hits": hits_list,
+        })
+
+    ranked = sorted(results, key=lambda r: (r["average_hits"], r["games_11_plus"], r["max_hits"]), reverse=True)
+    return {
+        "ok": True,
+        "pattern": f"{even}-{odd}",
+        "compared_games": max_index,
+        "history_per_game": history,
+        "best_profile": ranked[0] if ranked else None,
+        "profiles": ranked,
+        "note": "Endpoint de laboratorio; nao altera a estrategia principal automaticamente.",
         "updated_at": dt.datetime.now(BRT).strftime("%d/%m/%Y %H:%M:%S"),
     }
 
