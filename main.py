@@ -15,23 +15,23 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 print(">>> MAIN.PY NOVO COM /SIMULATE CARREGADO <<<")
 
-# Lotofacil API â€“ v6.5.1
-# - Coleta resultados da LotofÃ¡cil com 3 nÃ­veis:
-#     1) Mirror pÃºblico (opcionalmente preferido)
+# Lotofacil API Ã¢â‚¬â€œ v6.5.1
+# - Coleta resultados da LotofÃƒÂ¡cil com 3 nÃƒÂ­veis:
+#     1) Mirror pÃƒÂºblico (opcionalmente preferido)
 #     2) JSON oficial (Portal de Loterias CAIXA)
-#     3) HTML oficial (pÃ¡gina de resultados: scraping tolerante)
-# - UI simples em /app; /ready mostra latest_contest; Ã­cones e PWA em /static.
+#     3) HTML oficial (pÃƒÂ¡gina de resultados: scraping tolerante)
+# - UI simples em /app; /ready mostra latest_contest; ÃƒÂ­cones e PWA em /static.
 
 
 # ----------------------------------------------------------------------
-# Paths / versÃ£o
+# Paths / versÃƒÂ£o
 # ----------------------------------------------------------------------
 BASE_DIR = Path(__file__).parent
 STATIC_DIR = (BASE_DIR / "static").resolve()
 APP_VERSION = "6.5.1"
 
 # ----------------------------------------------------------------------
-# ConfiguraÃ§Ã£o de Logging
+# ConfiguraÃƒÂ§ÃƒÂ£o de Logging
 # ----------------------------------------------------------------------
 # Configura logging detalhado
 logging.basicConfig(
@@ -51,24 +51,24 @@ formatter = logging.Formatter(
 console_handler.setFormatter(formatter)
 logger.addHandler(console_handler)
 
-# Desativa logs do uvicorn se quiser menos ruÃ­do
+# Desativa logs do uvicorn se quiser menos ruÃƒÂ­do
 logging.getLogger("uvicorn").setLevel(logging.WARNING)
 logging.getLogger("uvicorn.error").setLevel(logging.WARNING)
 
-logger.info(f"ðŸŽ¯ Lotofacil API v{APP_VERSION} iniciando...")
+logger.info(f"Ã°Å¸Å½Â¯ Lotofacil API v{APP_VERSION} iniciando...")
 # ----------------------------------------------------------------------
 # App
 # ----------------------------------------------------------------------
-app = FastAPI(title="LotofÃ¡cil API", version=APP_VERSION)
+app = FastAPI(title="LotofÃƒÂ¡cil API", version=APP_VERSION)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"], allow_credentials=True,
     allow_methods=["*"], allow_headers=["*"],
 )
-# Sirva a pasta "static" (Ã­cones/manifest/sw)
+# Sirva a pasta "static" (ÃƒÂ­cones/manifest/sw)
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
-# --- DIAGNÃ“STICO /static (Ãºtil pra 404) -------------------------------
+# --- DIAGNÃƒâ€œSTICO /static (ÃƒÂºtil pra 404) -------------------------------
 logger = logging.getLogger("uvicorn.error")
 
 
@@ -101,13 +101,13 @@ CAIXA_HOSTS = [
     "https://loterias.caixa.gov.br/portaldeloterias/api/lotofacil",
 ]
 
-# --- PÃ¡gina oficial (HTML) para scraping ---
+# --- PÃƒÂ¡gina oficial (HTML) para scraping ---
 CAIXA_HTML_URLS = [
     "https://loterias.caixa.gov.br/Paginas/Lotofacil.aspx",
     "https://loterias.caixa.gov.br/Paginas/Lotofacil.aspx?concurso={n}",
 ]
 
-# --- Mirror pÃºblico (somente leitura) ---
+# --- Mirror pÃƒÂºblico (somente leitura) ---
 MIRROR_LATEST = "https://loteriascaixa-api.herokuapp.com/api/lotofacil/latest"
 MIRROR_BY_ID = "https://loteriascaixa-api.herokuapp.com/api/lotofacil/{n}"
 
@@ -197,7 +197,7 @@ def validate_parity(even: int, odd: int) -> Tuple[int, int]:
     if even + odd != 15:
         raise HTTPException(
             status_code=422,
-            detail="Paridade invÃ¡lida: even + odd deve ser igual a 15"
+            detail="Paridade invÃƒÂ¡lida: even + odd deve ser igual a 15"
         )
     return even, odd
 
@@ -283,7 +283,7 @@ def classify_trend(draws: List[dict], window: int = 20):
             counts[n] += 1
 
     # AJUSTE OS LIMITES PARA SEREM MAIS RESTRITIVOS:
-    # Quentes: apareceram em 70%+ dos Ãºltimos concursos
+    # Quentes: apareceram em 70%+ dos ÃƒÂºltimos concursos
     # Mornas: apareceram em 30%-70%
     # Frias: apareceram em menos de 30%
 
@@ -302,6 +302,113 @@ def classify_trend(draws: List[dict], window: int = 20):
     }
 
 
+def number_band(n: int) -> str:
+    if n <= 9:
+        return "low"
+    if n <= 19:
+        return "mid"
+    return "high"
+
+
+def number_gap(draws: List[dict], n: int) -> int:
+    for idx, d in enumerate(draws):
+        if n in set(d.get("numbers", [])):
+            return idx
+    return len(draws) + 1
+
+
+def band_targets(needed: int, parity: str) -> Dict[str, int]:
+    if needed <= 0:
+        return {"low": 0, "mid": 0, "high": 0}
+    if needed == 8:
+        return {"low": 3, "mid": 3, "high": 2}
+    if needed == 7:
+        return {"low": 2, "mid": 3, "high": 2} if parity == "even" else {"low": 3, "mid": 2, "high": 2}
+    if needed == 6:
+        return {"low": 2, "mid": 2, "high": 2}
+    if needed == 9:
+        return {"low": 3, "mid": 4, "high": 2}
+
+    targets = {"low": needed // 3, "mid": needed // 3, "high": needed // 3}
+    for band in ("mid", "low", "high"):
+        if sum(targets.values()) < needed:
+            targets[band] += 1
+    return targets
+
+
+def build_number_scores(
+    draws: List[dict],
+    hot: List[int],
+    warm: List[int],
+    cold: List[int],
+) -> List[Dict[str, Any]]:
+    total = max(1, len(draws))
+    recent = draws[:min(20, len(draws))]
+    recent_total = max(1, len(recent))
+    last_draw = set(draws[0].get("numbers", [])) if draws else set()
+
+    long_counts = {f["n"]: f["count"] for f in frequencies(draws)}
+    recent_counts = {f["n"]: f["count"] for f in frequencies(recent)}
+
+    out = []
+    for n in range(1, 26):
+        gap = number_gap(draws, n)
+        long_score = (long_counts.get(n, 0) / total) * 42
+        recent_score = (recent_counts.get(n, 0) / recent_total) * 34
+        repeat_score = 8 if n in last_draw else 0
+        if 1 <= gap <= 4:
+            gap_score = 8
+        elif gap == 0:
+            gap_score = 3
+        elif 5 <= gap <= 9:
+            gap_score = 4
+        elif gap >= 14:
+            gap_score = -4
+        else:
+            gap_score = 0
+
+        trend_score = 4 if n in hot else 6 if n in warm else 1 if n in cold else 0
+        score = long_score + recent_score + repeat_score + gap_score + trend_score
+        out.append({
+            "n": n,
+            "count": long_counts.get(n, 0),
+            "recent_count": recent_counts.get(n, 0),
+            "gap": gap,
+            "band": number_band(n),
+            "score": round(score, 4),
+        })
+    return out
+
+
+def select_balanced_numbers(
+    scored: List[Dict[str, Any]],
+    needed: int,
+    parity: str,
+) -> List[Dict[str, Any]]:
+    candidates = [x for x in scored if (x["n"] % 2 == 0) == (parity == "even")]
+    candidates = sorted(candidates, key=lambda x: (-x["score"], -x["recent_count"], -x["count"], x["n"]))
+    targets = band_targets(needed, parity)
+
+    selected: List[Dict[str, Any]] = []
+    selected_nums = set()
+
+    for band in ("low", "mid", "high"):
+        band_items = [x for x in candidates if x["band"] == band and x["n"] not in selected_nums]
+        for item in band_items[:targets.get(band, 0)]:
+            selected.append(item)
+            selected_nums.add(item["n"])
+
+    if len(selected) < needed:
+        for item in candidates:
+            if item["n"] not in selected_nums:
+                selected.append(item)
+                selected_nums.add(item["n"])
+            if len(selected) >= needed:
+                break
+
+    return selected[:needed]
+
+
 def build_parity_suggestion(
     draws: List[dict],
     even_needed: int = 8,
@@ -309,14 +416,14 @@ def build_parity_suggestion(
 ) -> Dict[str, Any]:
 
     # ======================================================
-    # INÃCIO DO BLOCO DE TRATAMENTO DE ERROS
+    # INÃƒÂCIO DO BLOCO DE TRATAMENTO DE ERROS
     # ======================================================
     try:
         logger.debug(
-            f"[LIVRO NEGRO] Iniciando sugestÃ£o com {len(draws)} concursos")
+            f"[LIVRO NEGRO] Iniciando sugestÃƒÂ£o com {len(draws)} concursos")
 
         # ------------------------------------------------------
-        # ValidaÃ§Ã£o bÃ¡sica de entrada
+        # ValidaÃƒÂ§ÃƒÂ£o bÃƒÂ¡sica de entrada
         # ------------------------------------------------------
         if not draws or len(draws) < 2:
             logger.warning(
@@ -329,7 +436,7 @@ def build_parity_suggestion(
                 "pattern": f"{even_needed}-{odd_needed}",
                 "valid": False,
                 "rules": {"sum_ok": False, "repeat_ok": False},
-                "error": "Draws insuficientes para anÃ¡lise"
+                "error": "Draws insuficientes para anÃƒÂ¡lise"
             }
 
         # ------------------------------------------------------
@@ -340,10 +447,10 @@ def build_parity_suggestion(
             logger.debug(
                 f"[LIVRO NEGRO] Primeiros concursos: {', '.join(sample)}")
             logger.debug(
-                f"[LIVRO NEGRO] Config: {even_needed} pares, {odd_needed} Ã­mpares")
+                f"[LIVRO NEGRO] Config: {even_needed} pares, {odd_needed} ÃƒÂ­mpares")
 
         # ------------------------------------------------------
-        # SeguranÃ§a bÃ¡sica de parÃ¢metros
+        # SeguranÃƒÂ§a bÃƒÂ¡sica de parÃƒÂ¢metros
         # ------------------------------------------------------
         even_needed = max(0, min(15, even_needed))
         odd_needed = max(0, min(15 - even_needed, odd_needed))
@@ -353,13 +460,13 @@ def build_parity_suggestion(
                 f"[LIVRO NEGRO] Paridade ajustada para {even_needed}-{odd_needed}")
 
         # ------------------------------------------------------
-        # Ãšltimo concurso (regra das repetidas)
+        # ÃƒÅ¡ltimo concurso (regra das repetidas)
         # ------------------------------------------------------
         last_draw = draws[0]["numbers"] if draws else []
-        logger.debug(f"[LIVRO NEGRO] Ãšltimo concurso: {sorted(last_draw)}")
+        logger.debug(f"[LIVRO NEGRO] ÃƒÅ¡ltimo concurso: {sorted(last_draw)}")
 
         # ------------------------------------------------------
-        # TENDÃŠNCIA â€” Livro Negro (janela fixa = 20)
+        # TENDÃƒÅ NCIA Ã¢â‚¬â€ Livro Negro (janela fixa = 20)
         # ------------------------------------------------------
         trend = classify_trend(draws, window=20)
         hot = trend.get("hot", [])
@@ -370,87 +477,34 @@ def build_parity_suggestion(
         logger.debug(f"[LIVRO NEGRO] Mornas : {sorted(warm)}")
         logger.debug(f"[LIVRO NEGRO] Frias  : {sorted(cold)}")
 
-        allowed = set(hot + warm)   # frias ficam FORA
-        logger.debug(
-            f"[LIVRO NEGRO] Dezenas permitidas ({len(allowed)}): {sorted(allowed)}")
-
         # ------------------------------------------------------
-        # FrequÃªncia apenas das dezenas permitidas
+        # NOVA ESTRATEGIA: pontuacao composta + cotas por faixa.
+        # Mantem a paridade escolhida, mas melhora a selecao interna
+        # com frequencia longa, recencia, repeticao, atraso e distribuicao.
         # ------------------------------------------------------
-        freq_all = frequencies(draws)
-        freq = [f for f in freq_all if f["n"] in allowed]
-
-        if not freq or len(freq) < 15:
-            logger.warning(
-                f"[LIVRO NEGRO] FrequÃªncia insuficiente: {len(freq)} dezenas")
-            # Fallback: usar todas as dezenas
-            freq = freq_all
-
-        # ------------------------------------------------------
-        # SeleÃ§Ã£o por paridade (8 pares / 7 Ã­mpares)
-        # ------------------------------------------------------
-        # ðŸ”¥ EstratÃ©gia dinÃ¢mica baseada na paridade dominante
-        if even_needed > odd_needed:
-            # Mais pares â†’ prioriza PARES quentes, ÃMPARES mornos
-            ev_pool = [f for f in freq if f["n"] % 2 == 0]
-            od_pool = [f for f in freq if f["n"] % 2 == 1]
-
-            ev = sorted(
-                ev_pool, key=lambda x: (-x["count"], x["n"]))[:even_needed]
-            od = sorted(od_pool, key=lambda x: (
-                x["count"], x["n"]))[:odd_needed]
-
-        elif odd_needed > even_needed:
-            # Mais Ã­mpares â†’ prioriza ÃMPARES quentes, PARES mornos
-            ev_pool = [f for f in freq if f["n"] % 2 == 0]
-            od_pool = [f for f in freq if f["n"] % 2 == 1]
-
-            ev = sorted(ev_pool, key=lambda x: (
-                x["count"], x["n"]))[:even_needed]
-            od = sorted(
-                od_pool, key=lambda x: (-x["count"], x["n"]))[:odd_needed]
-
-        else:
-            # equilÃ­brio â†’ lÃ³gica atual
-            ev = sorted(
-                [f for f in freq if f["n"] % 2 == 0],
-                key=lambda x: (-x["count"], x["n"])
-            )[:even_needed]
-
-            od = sorted(
-                [f for f in freq if f["n"] % 2 == 1],
-                key=lambda x: (-x["count"], x["n"])
-            )[:odd_needed]
-
-        # Verifica se temos nÃºmeros suficientes
-        if len(ev) < even_needed or len(od) < odd_needed:
-            logger.warning(
-                f"[LIVRO NEGRO] SeleÃ§Ã£o incompleta: {len(ev)} pares, {len(od)} Ã­mpares")
-
-            # Recalcula usando TODAS as dezenas (fallback correto)
-            sorted_all = sorted(freq_all, key=lambda x: (-x["count"], x["n"]))
-
-            ev = [f for f in sorted_all if f["n"] % 2 == 0][:even_needed]
-            od = [f for f in sorted_all if f["n"] % 2 == 1][:odd_needed]
+        scored = build_number_scores(draws, hot, warm, cold)
+        ev = select_balanced_numbers(scored, even_needed, "even")
+        od = select_balanced_numbers(scored, odd_needed, "odd")
 
         combo = sorted([x["n"] for x in ev] + [x["n"] for x in od])
-
-        logger.debug(f"[LIVRO NEGRO] Combo gerado: {combo}")
-
-        # ======================================================
-        # REGRA DO LIVRO NEGRO â€” VALIDAÃ‡ÃƒO (SEM BLOQUEIO)
-        # ======================================================
 
         valid_sum_ok = valid_sum(combo)
         valid_repeat_ok = limit_repetition(combo, last_draw, max_repeat=9)
         valid = valid_sum_ok and valid_repeat_ok
 
-        logger.debug(
-            f"[LIVRO NEGRO] ValidaÃ§Ãµes: sum_ok={valid_sum_ok}, repeat_ok={valid_repeat_ok}, valid={valid}")
+        band_profile = {
+            "even": {
+                "low": sum(1 for x in ev if x["band"] == "low"),
+                "mid": sum(1 for x in ev if x["band"] == "mid"),
+                "high": sum(1 for x in ev if x["band"] == "high"),
+            },
+            "odd": {
+                "low": sum(1 for x in od if x["band"] == "low"),
+                "mid": sum(1 for x in od if x["band"] == "mid"),
+                "high": sum(1 for x in od if x["band"] == "high"),
+            },
+        }
 
-        # ------------------------------------------------------
-        # Retorno final
-        # ------------------------------------------------------
         return {
             "even": [x["n"] for x in ev],
             "odd":  [x["n"] for x in od],
@@ -469,12 +523,15 @@ def build_parity_suggestion(
                 "hot_count": len(hot),
                 "warm_count": len(warm),
                 "cold_count": len(cold),
-                "draws_analyzed": len(draws)
+                "draws_analyzed": len(draws),
+                "strategy": "balanced_score_v2",
+                "band_profile": band_profile
             }
         }
 
+
     except Exception as e:
-        logger.error(f"[LIVRO NEGRO] ERRO CRÃTICO: {str(e)}", exc_info=True)
+        logger.error(f"[LIVRO NEGRO] ERRO CRÃƒÂTICO: {str(e)}", exc_info=True)
         return {
             "even": [],
             "odd": [],
@@ -691,7 +748,7 @@ async def _html_get_concurso(n: int) -> Optional[Dict[str, Any]]:
     return None
 
 # ----------------------------------------------------------------------
-# Resolver de dados (3 nÃ­veis) + coleta
+# Resolver de dados (3 nÃƒÂ­veis) + coleta
 # ----------------------------------------------------------------------
 
 
@@ -756,8 +813,8 @@ async def _get_concurso(n: int) -> Optional[Dict[str, Any]]:
 
 
 async def collect_last_n(limit: int) -> List[dict]:
-    """Coleta os Ãºltimos N concursos com logging detalhado"""
-    logger.info(f"[COLETA] Iniciando coleta dos Ãºltimos {limit} concursos")
+    """Coleta os ÃƒÂºltimos N concursos com logging detalhado"""
+    logger.info(f"[COLETA] Iniciando coleta dos ÃƒÂºltimos {limit} concursos")
 
     try:
         latest = await _get_latest()
@@ -767,7 +824,7 @@ async def collect_last_n(limit: int) -> List[dict]:
             logger.warning("[COLETA] Nenhum concurso encontrado")
             return []
 
-        logger.info(f"[COLETA] Ãšltimo concurso: {last_n}")
+        logger.info(f"[COLETA] ÃƒÅ¡ltimo concurso: {last_n}")
 
         out: List[dict] = []
         n = last_n
@@ -783,15 +840,15 @@ async def collect_last_n(limit: int) -> List[dict]:
             if d:
                 out.append(d)
             else:
-                logger.warning(f"[COLETA] Concurso {n} nÃ£o encontrado")
+                logger.warning(f"[COLETA] Concurso {n} nÃƒÂ£o encontrado")
 
             n -= 1
 
-            # Pausa para nÃ£o sobrecarregar
+            # Pausa para nÃƒÂ£o sobrecarregar
             if request_count % 20 == 0:
                 await asyncio.sleep(0.1)
 
-        logger.info(f"[COLETA] Coleta concluÃ­da: {len(out)} concursos obtidos")
+        logger.info(f"[COLETA] Coleta concluÃƒÂ­da: {len(out)} concursos obtidos")
         logger.debug(
             f"[COLETA] Concursos coletados: {[d['contest'] for d in out[:5]]}...")
 
@@ -803,7 +860,7 @@ async def collect_last_n(limit: int) -> List[dict]:
 
 
 async def collect_by_date(start: Optional[dt.date], end: Optional[dt.date], max_fetch: int = 400) -> List[dict]:
-    """Coleta concursos por perÃ­odo com logging"""
+    """Coleta concursos por perÃƒÂ­odo com logging"""
     logger.info(f"[COLETA-PERIODO] Coletando de {start} a {end}")
 
     try:
@@ -825,7 +882,7 @@ async def collect_by_date(start: Optional[dt.date], end: Optional[dt.date], max_
 
             if fetched % 50 == 0:
                 logger.debug(
-                    f"[COLETA-PERIODO] {fetched} requests, {len(results)} concursos vÃ¡lidos")
+                    f"[COLETA-PERIODO] {fetched} requests, {len(results)} concursos vÃƒÂ¡lidos")
 
             d = await _get_concurso(n)
             n -= 1
@@ -836,13 +893,13 @@ async def collect_by_date(start: Optional[dt.date], end: Optional[dt.date], max_
             dd = parse_draw_date(d.get("date") or "")
             if dd is None:
                 logger.debug(
-                    f"[COLETA-PERIODO] Data invÃ¡lida no concurso {d.get('contest')}")
+                    f"[COLETA-PERIODO] Data invÃƒÂ¡lida no concurso {d.get('contest')}")
                 continue
 
             if start and dd < start:
                 if results:
                     logger.debug(
-                        f"[COLETA-PERIODO] Data {dd} antes do inÃ­cio {start}, parando")
+                        f"[COLETA-PERIODO] Data {dd} antes do inÃƒÂ­cio {start}, parando")
                     break
                 else:
                     continue
@@ -858,7 +915,7 @@ async def collect_by_date(start: Optional[dt.date], end: Optional[dt.date], max_
 
         results.sort(key=lambda x: int(x["contest"]), reverse=True)
         logger.info(
-            f"[COLETA-PERIODO] ConcluÃ­do: {len(results)} concursos no perÃ­odo")
+            f"[COLETA-PERIODO] ConcluÃƒÂ­do: {len(results)} concursos no perÃƒÂ­odo")
 
         return results
 
@@ -872,10 +929,10 @@ async def collect_by_date(start: Optional[dt.date], end: Optional[dt.date], max_
 
 
 @app.get("/", response_class=JSONResponse)
-@app.head("/")  # â¬…ï¸ ADICIONE ESTA LINHA!
+@app.head("/")  # Ã¢Â¬â€¦Ã¯Â¸Â ADICIONE ESTA LINHA!
 async def root():
     return {
-        "message": "Lotofacil API estÃ¡ online!",
+        "message": "Lotofacil API estÃƒÂ¡ online!",
         "version": APP_VERSION,
         "docs": "/docs",
         "examples": {
@@ -951,7 +1008,7 @@ async def stats(limit: int = Query(60, ge=1, le=200),
     draws = await collect_last_n(limit)
     freqs = frequencies(draws)
 
-    # sugestÃ£o oficial (Livro Negro)
+    # sugestÃƒÂ£o oficial (Livro Negro)
     sugg = build_parity_suggestion(draws, 8, 7)
 
     payload = {
@@ -962,7 +1019,7 @@ async def stats(limit: int = Query(60, ge=1, le=200),
         "lo": lo,
         "frequencies": freqs,
 
-        # >>>>> AQUI ESTÃ A CORREÃ‡ÃƒO <<<<<
+        # >>>>> AQUI ESTÃƒÂ A CORREÃƒâ€¡ÃƒÆ’O <<<<<
         "suggestion": sugg,
 
         "parity_pattern_example": sugg["pattern"],
@@ -1044,7 +1101,7 @@ async def ui():
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Lotofácil</title>
+<title>LotofÃ¡cil</title>
 <link rel="manifest" href="/static/manifest.webmanifest?v=3">
 <link rel="icon" href="/static/favicon.ico">
 <meta name="theme-color" content="#0f172a">
@@ -1082,16 +1139,16 @@ button:disabled{opacity:.6;cursor:not-allowed}
 </head>
 <body>
 <div class="wrap">
-  <div class="topbar"><div><h1>Lotofácil</h1><div class="subtitle">Sugestão por frequência e paridade com backtest automático do último concurso.</div></div><div id="requestStatus" class="status">Aguardando dados</div></div>
+  <div class="topbar"><div><h1>LotofÃ¡cil</h1><div class="subtitle">SugestÃ£o por frequÃªncia e paridade com backtest automÃ¡tico do Ãºltimo concurso.</div></div><div id="requestStatus" class="status">Aguardando dados</div></div>
   <div class="grid">
     <aside>
-      <div class="card"><div class="title">Parâmetros <span id="currentPattern" class="pill">8-7</span></div><div class="form"><div class="field"><label for="selWindow">Janela</label><select id="selWindow"><option value="1m">1 mês</option><option value="3m" selected>3 meses</option><option value="6m">6 meses</option><option value="all">Tudo</option></select></div><div class="split"><div class="field"><label for="inpEven">Pares</label><input id="inpEven" type="text" value="8" inputmode="numeric" pattern="[0-9]*" maxlength="2" autocomplete="off"></div><div class="field"><label for="inpOdd">Ímpares</label><input id="inpOdd" type="text" value="7" inputmode="numeric" pattern="[0-9]*" maxlength="2" autocomplete="off"></div></div><button id="btnRefresh" type="button">Atualizar</button></div><div class="summary"><div class="metric"><span>Jogos</span><strong id="gamesMetric">-</strong></div><div class="metric"><span>Paridade</span><strong id="patternMetric">8-7</strong></div><div class="metric"><span>Acertos</span><strong id="hitsMetric">-</strong></div></div></div>
+      <div class="card"><div class="title">ParÃ¢metros <span id="currentPattern" class="pill">8-7</span></div><div class="form"><div class="field"><label for="selWindow">Janela</label><select id="selWindow"><option value="1m">1 mÃªs</option><option value="3m" selected>3 meses</option><option value="6m">6 meses</option><option value="all">Tudo</option></select></div><div class="split"><div class="field"><label for="inpEven">Pares</label><input id="inpEven" type="text" value="8" inputmode="numeric" pattern="[0-9]*" maxlength="2" autocomplete="off"></div><div class="field"><label for="inpOdd">Ãmpares</label><input id="inpOdd" type="text" value="7" inputmode="numeric" pattern="[0-9]*" maxlength="2" autocomplete="off"></div></div><button id="btnRefresh" type="button">Atualizar</button></div><div class="summary"><div class="metric"><span>Jogos</span><strong id="gamesMetric">-</strong></div><div class="metric"><span>Paridade</span><strong id="patternMetric">8-7</strong></div><div class="metric"><span>Acertos</span><strong id="hitsMetric">-</strong></div></div></div>
     </aside>
     <main class="main-stack">
-      <div id="simulationCard" class="card simulation-main neutral"><div class="simulation-head"><div class="title">Simulação automática</div><span id="contestBadge" class="badge badge-blue">Último concurso</span></div><div id="autoResult" class="result-line"><div class="loading-text">Executando backtest...</div></div><div class="legend sim-legend"><div class="legend-item"><span class="dot even"></span>Par</div><div class="legend-item"><span class="dot odd"></span>Ímpar</div><div class="legend-item"><span class="dot hit"></span>Acerto</div></div></div>
-      <div class="split"><div class="card tested-card"><div class="title">Sugestão testada</div><div id="autoSuggested" class="balls"></div></div><div class="card official-card"><div class="title">Resultado oficial</div><div id="autoOfficial" class="balls"></div></div></div>
-      <div class="card suggestion-card"><div class="title">Combinação sugerida <span id="suggestionPattern" class="pill">-</span></div><div id="suggBalls" class="balls"></div></div>
-      <div class="card history-section"><div class="title">Últimos 10 concursos oficiais <span id="historyStatus" class="badge badge-neutral">Carregando</span></div><div id="historyList" class="history-list"><div class="loading-text">Carregando últimos concursos...</div></div></div>
+      <div id="simulationCard" class="card simulation-main neutral"><div class="simulation-head"><div class="title">SimulaÃ§Ã£o automÃ¡tica</div><span id="contestBadge" class="badge badge-blue">Ãšltimo concurso</span></div><div id="autoResult" class="result-line"><div class="loading-text">Executando backtest...</div></div><div class="legend sim-legend"><div class="legend-item"><span class="dot even"></span>Par</div><div class="legend-item"><span class="dot odd"></span>Ãmpar</div><div class="legend-item"><span class="dot hit"></span>Acerto</div></div></div>
+      <div class="split"><div class="card tested-card"><div class="title">SugestÃ£o testada</div><div id="autoSuggested" class="balls"></div></div><div class="card official-card"><div class="title">Resultado oficial</div><div id="autoOfficial" class="balls"></div></div></div>
+      <div class="card suggestion-card"><div class="title">CombinaÃ§Ã£o sugerida <span id="suggestionPattern" class="pill">-</span></div><div id="suggBalls" class="balls"></div></div>
+      <div class="card history-section"><div class="title">Ãšltimos 10 concursos oficiais <span id="historyStatus" class="badge badge-neutral">Carregando</span></div><div id="historyList" class="history-list"><div class="loading-text">Carregando Ãºltimos concursos...</div></div></div>
     </main>
   </div>
 </div>
@@ -1110,12 +1167,12 @@ function finishEvenEdit(){if(el('inpEven').value==='')el('inpEven').value='8';co
 function finishOddEdit(){if(el('inpOdd').value==='')el('inpOdd').value='7';const O=clampParityValue(el('inpOdd').value,7);el('inpOdd').value=O;el('inpEven').value=15-O;updatePattern(15-O,O);}
 function readParity(){let E=clampParityValue(el('inpEven').value,8);let O=clampParityValue(el('inpOdd').value,15-E);if(E+O!==15)O=15-E;el('inpEven').value=E;el('inpOdd').value=O;updatePattern(E,O);return{E,O};}
 function renderBalls(targetId,numbers,hits=new Set()){el(targetId).innerHTML=(numbers||[]).map(n=>{const parityClass=n%2===0?'even':'odd';const hitClass=hits.has(n)?' hit':'';return `<div class="ball ${parityClass}${hitClass}" title="Dezena ${pad(n)}">${pad(n)}</div>`}).join('');}
-function setLoading(E,O){el('requestStatus').innerText=`Atualizando ${E}-${O}...`;el('suggBalls').innerHTML='<div class="loading-text">Atualizando sugestão...</div>';el('autoSuggested').innerHTML='';el('autoOfficial').innerHTML='';el('autoResult').innerHTML='<div class="loading-text">Executando backtest...</div>';el('hitsMetric').innerText='-';el('simulationCard').className='card simulation-main neutral';el('btnRefresh').disabled=true;el('btnRefresh').innerText='Atualizando...';}
+function setLoading(E,O){el('requestStatus').innerText=`Atualizando ${E}-${O}...`;el('suggBalls').innerHTML='<div class="loading-text">Atualizando sugestÃ£o...</div>';el('autoSuggested').innerHTML='';el('autoOfficial').innerHTML='';el('autoResult').innerHTML='<div class="loading-text">Executando backtest...</div>';el('hitsMetric').innerText='-';el('simulationCard').className='card simulation-main neutral';el('btnRefresh').disabled=true;el('btnRefresh').innerText='Atualizando...';}
 function setDone(){el('requestStatus').innerText='Dados atualizados';el('btnRefresh').disabled=false;el('btnRefresh').innerText='Atualizar';}
 function setError(message){el('requestStatus').innerText='Erro ao atualizar';el('autoResult').innerHTML=`<span class="error">${message}</span>`;el('btnRefresh').disabled=false;el('btnRefresh').innerText='Atualizar';}
 function renderHistory(draws){el('historyList').innerHTML=(draws||[]).map(d=>{const nums=d.numbers||[];const even=d.even_count??nums.filter(n=>n%2===0).length;const odd=d.odd_count??nums.filter(n=>n%2===1).length;const balls=nums.map(n=>`<span class="ball small ${n%2===0?'even':'odd'}">${pad(n)}</span>`).join('');return `<div class="history-card"><div class="history-meta"><div class="history-contest">Concurso ${d.contest}</div><div class="history-date">${d.date||'-'}</div></div><div class="history-numbers">${balls}</div><div class="history-pattern badge badge-blue">${even}-${odd}</div></div>`}).join('');}
-async function loadHistory(){el('historyStatus').innerText='Carregando';el('historyList').innerHTML='<div class="loading-text">Carregando últimos concursos...</div>';try{const data=await api('/lotofacil',{limit:10});renderHistory(data.results||[]);el('historyStatus').innerText=`${data.count||0} jogos`;}catch(err){el('historyStatus').innerText='Erro';el('historyList').innerHTML=`<span class="error">${err.message||'Falha ao carregar histórico'}</span>`;}}
-async function loadAll(force=false){const seq=++requestSeq;if(activeController)activeController.abort();activeController=new AbortController();const signal=activeController.signal;const {E,O}=readParity();const w=el('selWindow').value;setLoading(E,O);try{const p=await api('/parity',{window:w,even:E,odd:O,...(force?{force:true}:{})},signal);if(seq!==requestSeq)return;renderBalls('suggBalls',p.suggestion.combo);el('suggestionPattern').innerText=p.pattern||p.suggestion.pattern||`${E}-${O}`;el('gamesMetric').innerText=p.considered_games??'-';el('autoResult').innerHTML='<div class="loading-text">Executando backtest...</div>';const backtestPath=`/backtest/latest?even=${E}&odd=${O}`;console.log('[APP] Backtest:',backtestPath);const b=await api('/backtest/latest',{even:E,odd:O},signal);if(seq!==requestSeq)return;const hits=new Set(b.hits||[]);const didWin=(b.hits_count||0)>=11;renderBalls('autoSuggested',b.suggested,hits);renderBalls('autoOfficial',b.official,hits);el('simulationCard').className=`card simulation-main ${didWin?'win':'neutral'}`;el('contestBadge').className='badge badge-blue';el('contestBadge').innerText=`Concurso ${b.contest}`;el('hitsMetric').innerText=b.hits_count;el('patternMetric').innerText=b.pattern;el('currentPattern').innerText=b.pattern;el('autoResult').innerHTML=`<div class="hit-display">${didWin?'✅':'•'} ${b.hits_count} acertos</div><div class="sim-badges"><span class="badge ${didWin?'badge-green':'badge-neutral'}">${b.hits_count} acertos</span><span class="badge badge-blue">Paridade ${b.pattern}</span><span class="badge badge-yellow">Concurso ${b.contest}</span></div>`;setDone();}catch(err){if(err.name==='AbortError')return;setError(err.message||'Falha inesperada');}}
+async function loadHistory(){el('historyStatus').innerText='Carregando';el('historyList').innerHTML='<div class="loading-text">Carregando Ãºltimos concursos...</div>';try{const data=await api('/lotofacil',{limit:10});renderHistory(data.results||[]);el('historyStatus').innerText=`${data.count||0} jogos`;}catch(err){el('historyStatus').innerText='Erro';el('historyList').innerHTML=`<span class="error">${err.message||'Falha ao carregar histÃ³rico'}</span>`;}}
+async function loadAll(force=false){const seq=++requestSeq;if(activeController)activeController.abort();activeController=new AbortController();const signal=activeController.signal;const {E,O}=readParity();const w=el('selWindow').value;setLoading(E,O);try{const p=await api('/parity',{window:w,even:E,odd:O,...(force?{force:true}:{})},signal);if(seq!==requestSeq)return;renderBalls('suggBalls',p.suggestion.combo);el('suggestionPattern').innerText=p.pattern||p.suggestion.pattern||`${E}-${O}`;el('gamesMetric').innerText=p.considered_games??'-';el('autoResult').innerHTML='<div class="loading-text">Executando backtest...</div>';const backtestPath=`/backtest/latest?even=${E}&odd=${O}`;console.log('[APP] Backtest:',backtestPath);const b=await api('/backtest/latest',{even:E,odd:O},signal);if(seq!==requestSeq)return;const hits=new Set(b.hits||[]);const didWin=(b.hits_count||0)>=11;renderBalls('autoSuggested',b.suggested,hits);renderBalls('autoOfficial',b.official,hits);el('simulationCard').className=`card simulation-main ${didWin?'win':'neutral'}`;el('contestBadge').className='badge badge-blue';el('contestBadge').innerText=`Concurso ${b.contest}`;el('hitsMetric').innerText=b.hits_count;el('patternMetric').innerText=b.pattern;el('currentPattern').innerText=b.pattern;el('autoResult').innerHTML=`<div class="hit-display">${didWin?'âœ…':'â€¢'} ${b.hits_count} acertos</div><div class="sim-badges"><span class="badge ${didWin?'badge-green':'badge-neutral'}">${b.hits_count} acertos</span><span class="badge badge-blue">Paridade ${b.pattern}</span><span class="badge badge-yellow">Concurso ${b.contest}</span></div>`;setDone();}catch(err){if(err.name==='AbortError')return;setError(err.message||'Falha inesperada');}}
 document.addEventListener('DOMContentLoaded',()=>{el('inpEven').addEventListener('input',()=>cleanNumericInput('inpEven'));el('inpOdd').addEventListener('input',()=>cleanNumericInput('inpOdd'));el('inpEven').addEventListener('blur',()=>{finishEvenEdit();loadAll(false);});el('inpOdd').addEventListener('blur',()=>{finishOddEdit();loadAll(false);});el('selWindow').addEventListener('change',()=>loadAll(false));el('btnRefresh').addEventListener('click',()=>loadAll(true));loadAll(false);loadHistory();});
 </script>
 </body>
@@ -1136,8 +1193,8 @@ async def simulate(
     odd: int = Query(7, ge=0, le=15),
 ):
     """
-    SimulaÃ§Ã£o histÃ³rica:
-    - Gera a combinaÃ§Ã£o que teria sido sugerida ATÃ‰ a data do concurso informado
+    SimulaÃƒÂ§ÃƒÂ£o histÃƒÂ³rica:
+    - Gera a combinaÃƒÂ§ÃƒÂ£o que teria sido sugerida ATÃƒâ€° a data do concurso informado
     - Compara com o resultado real
     """
 
@@ -1146,20 +1203,20 @@ async def simulate(
     # --------------------------------------------------
     # 1. Buscar o concurso alvo
     # --------------------------------------------------
-    all_draws = await collect_last_n(500)  # margem grande de seguranÃ§a
+    all_draws = await collect_last_n(500)  # margem grande de seguranÃƒÂ§a
 
     target = next((d for d in all_draws if d["contest"] == contest), None)
     if not target:
         return JSONResponse(
             status_code=404,
-            content={"ok": False, "error": "Concurso nÃ£o encontrado"}
+            content={"ok": False, "error": "Concurso nÃƒÂ£o encontrado"}
         )
 
     target_date = parse_draw_date(target["date"])
     target_numbers = target["numbers"]
 
     # --------------------------------------------------
-    # 2. HistÃ³rico SOMENTE ANTES do concurso alvo
+    # 2. HistÃƒÂ³rico SOMENTE ANTES do concurso alvo
     # --------------------------------------------------
     past_draws = [
         d for d in all_draws
@@ -1169,11 +1226,11 @@ async def simulate(
     if len(past_draws) < 20:
         return JSONResponse(
             status_code=400,
-            content={"ok": False, "error": "HistÃ³rico insuficiente para simulaÃ§Ã£o"}
+            content={"ok": False, "error": "HistÃƒÂ³rico insuficiente para simulaÃƒÂ§ÃƒÂ£o"}
         )
 
     # --------------------------------------------------
-    # 3. Gerar sugestÃ£o COMO SE FOSSE NAQUELA DATA
+    # 3. Gerar sugestÃƒÂ£o COMO SE FOSSE NAQUELA DATA
     # --------------------------------------------------
     sugg = build_parity_suggestion(
         past_draws,
@@ -1184,7 +1241,7 @@ async def simulate(
     combo = sugg.get("combo", [])
 
     # --------------------------------------------------
-    # 4. ComparaÃ§Ã£o (acertos)
+    # 4. ComparaÃƒÂ§ÃƒÂ£o (acertos)
     # --------------------------------------------------
     hits = sorted(set(combo) & set(target_numbers))
 
@@ -1207,40 +1264,40 @@ async def simulate(
 
 @app.get("/backtest/latest")
 async def backtest_latest(
-    even: int = Query(8, ge=0, le=15),  # <-- ESTA LINHA JÃ ESTÃ OK
-    odd: int = Query(7, ge=0, le=15)    # <-- ESTA LINHA JÃ ESTÃ OK
+    even: int = Query(8, ge=0, le=15),  # <-- ESTA LINHA JÃƒÂ ESTÃƒÂ OK
+    odd: int = Query(7, ge=0, le=15)    # <-- ESTA LINHA JÃƒÂ ESTÃƒÂ OK
 ):
     """
-    Backtest automÃ¡tico CORRETO com paridade configurÃ¡vel.
+    Backtest automÃƒÂ¡tico CORRETO com paridade configurÃƒÂ¡vel.
     """
     even, odd = validate_parity(even, odd)
     logger.info(f"[BACKTEST] Iniciando com paridade {even}-{odd}")
 
     try:
-        # 1. Buscar o Ãºltimo concurso
+        # 1. Buscar o ÃƒÂºltimo concurso
         latest = await _get_latest()
         latest_contest = int(latest.get("contest") or 0)
 
         logger.info(
-            f"[BACKTEST] Ãšltimo concurso identificado: {latest_contest}")
+            f"[BACKTEST] ÃƒÅ¡ltimo concurso identificado: {latest_contest}")
 
         if latest_contest <= 1:
-            logger.warning("[BACKTEST] Concurso insuficiente para anÃ¡lise")
+            logger.warning("[BACKTEST] Concurso insuficiente para anÃƒÂ¡lise")
             return {
                 "ok": False,
-                "error": "NÃ£o hÃ¡ concurso suficiente para backtest"
+                "error": "NÃƒÂ£o hÃƒÂ¡ concurso suficiente para backtest"
             }
 
-        # 2. Buscar resultado oficial do Ãºltimo concurso
+        # 2. Buscar resultado oficial do ÃƒÂºltimo concurso
         logger.debug(f"[BACKTEST] Buscando dados do concurso {latest_contest}")
         latest_draw = await _get_concurso(latest_contest)
 
         if not latest_draw:
             logger.error(
-                f"[BACKTEST] Concurso {latest_contest} nÃ£o encontrado")
+                f"[BACKTEST] Concurso {latest_contest} nÃƒÂ£o encontrado")
             return {
                 "ok": False,
-                "error": "NÃ£o foi possÃ­vel obter o Ãºltimo concurso"
+                "error": "NÃƒÂ£o foi possÃƒÂ­vel obter o ÃƒÂºltimo concurso"
             }
 
         official_numbers = latest_draw.get("numbers", [])
@@ -1273,13 +1330,13 @@ async def backtest_latest(
 
         if len(previous_draws) < 20:
             logger.warning(
-                f"[BACKTEST] HistÃ³rico insuficiente: {len(previous_draws)} concursos")
+                f"[BACKTEST] HistÃƒÂ³rico insuficiente: {len(previous_draws)} concursos")
             return {
                 "ok": False,
-                "error": f"HistÃ³rico insuficiente: apenas {len(previous_draws)} concursos anteriores"
+                "error": f"HistÃƒÂ³rico insuficiente: apenas {len(previous_draws)} concursos anteriores"
             }
 
-        # 4. Gerar sugestÃ£o com a paridade SELECIONADA pelo usuÃ¡rio
+        # 4. Gerar sugestÃƒÂ£o com a paridade SELECIONADA pelo usuÃƒÂ¡rio
         logger.info(
             f"[BACKTEST] Executando Livro Negro com paridade {even}-{odd}")
         suggestion = build_parity_suggestion(
@@ -1292,14 +1349,14 @@ async def backtest_latest(
 
         if len(suggested_numbers) != 15:
             logger.error(
-                f"[BACKTEST] SugestÃ£o incompleta: {len(suggested_numbers)} nÃºmeros")
+                f"[BACKTEST] SugestÃƒÂ£o incompleta: {len(suggested_numbers)} nÃƒÂºmeros")
             return {
                 "ok": False,
-                "error": "SugestÃ£o incompleta gerada"
+                "error": "SugestÃƒÂ£o incompleta gerada"
             }
 
         logger.debug(
-            f"[BACKTEST] SugestÃ£o gerada: {sorted(suggested_numbers)}")
+            f"[BACKTEST] SugestÃƒÂ£o gerada: {sorted(suggested_numbers)}")
 
         # 5. Calcular acertos
         hits = sorted(set(suggested_numbers) & set(official_numbers))
@@ -1330,7 +1387,7 @@ async def backtest_latest(
         }
 
     except Exception as e:
-        logger.error(f"[BACKTEST] Erro crÃ­tico: {str(e)}", exc_info=True)
+        logger.error(f"[BACKTEST] Erro crÃƒÂ­tico: {str(e)}", exc_info=True)
         return {
             "ok": False,
             "error": f"Erro interno: {str(e)}"
@@ -1339,7 +1396,7 @@ async def backtest_latest(
 
 @app.get("/debug/backtest")
 async def debug_backtest():
-    """Endpoint para diagnÃ³stico do backtest"""
+    """Endpoint para diagnÃƒÂ³stico do backtest"""
     try:
         # Testar cada componente
         latest = await _get_latest()
@@ -1358,7 +1415,7 @@ async def debug_backtest():
                 "timestamp": dt.datetime.now(BRT).strftime("%d/%m/%Y %H:%M:%S")
             }
         else:
-            return {"ok": False, "error": "NÃ£o foi possÃ­vel obter o Ãºltimo concurso"}
+            return {"ok": False, "error": "NÃƒÂ£o foi possÃƒÂ­vel obter o ÃƒÂºltimo concurso"}
 
     except Exception as e:
         return {"ok": False, "error": str(e)}
@@ -1366,15 +1423,15 @@ async def debug_backtest():
 
 @app.get("/backtest/history")
 async def backtest_history(limit: int = Query(10, ge=1, le=50)):
-    """Mostra a evoluÃ§Ã£o das sugestÃµes ao longo do tempo"""
-    # ImplementaÃ§Ã£o que pega os Ãºltimos N concursos
-    # e mostra a sugestÃ£o que seria feita para cada um
+    """Mostra a evoluÃƒÂ§ÃƒÂ£o das sugestÃƒÂµes ao longo do tempo"""
+    # ImplementaÃƒÂ§ÃƒÂ£o que pega os ÃƒÂºltimos N concursos
+    # e mostra a sugestÃƒÂ£o que seria feita para cada um
     # e quantos acertos teria dado
 
 
 @app.get("/render-test")
 async def render_test():
-    """Teste especÃ­fico para Render"""
+    """Teste especÃƒÂ­fico para Render"""
     import os
     return {
         "status": "ok",
@@ -1388,7 +1445,7 @@ async def render_test():
 
 @app.get("/debug/render")
 async def debug_render():
-    """Endpoint especÃ­fico para debug no Render"""
+    """Endpoint especÃƒÂ­fico para debug no Render"""
     import os
     return {
         "status": "ok",
