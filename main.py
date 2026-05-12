@@ -1444,6 +1444,134 @@ async def parity(
     payload["cache_age_seconds"] = 0
     return payload
 
+
+PARITY_CANDIDATES: List[Tuple[int, int]] = [(6, 9), (7, 8), (8, 7), (9, 6)]
+
+
+def summarize_derived_backtest(
+    draws: List[Dict[str, Any]],
+    even: int,
+    odd: int,
+    limit: int = 30,
+    history: int = 50,
+) -> Dict[str, Any]:
+    rows: List[Dict[str, Any]] = []
+    max_index = min(limit, max(0, len(draws) - history))
+
+    for idx in range(max_index):
+        target = draws[idx]
+        past_draws = draws[idx + 1:idx + 1 + history]
+        official = set(target.get("numbers", []))
+        suggestion = build_parity_suggestion(past_draws, even, odd)
+
+        tested = []
+        for game in suggestion.get("games", []):
+            numbers = game.get("numbers", [])
+            tested.append(len(set(numbers) & official))
+
+        if not tested:
+            continue
+
+        principal_hits = tested[0]
+        best_hits = max(tested)
+        rows.append({
+            "contest": target.get("contest"),
+            "principal_hits": principal_hits,
+            "best_hits": best_hits,
+            "best_delta": best_hits - principal_hits,
+        })
+
+    principal = [r["principal_hits"] for r in rows]
+    best = [r["best_hits"] for r in rows]
+
+    return {
+        "compared_games": len(rows),
+        "history_per_game": history,
+        "principal_average": round(sum(principal) / len(principal), 2) if principal else 0,
+        "best_set_average": round(sum(best) / len(best), 2) if best else 0,
+        "principal_11_plus": sum(1 for h in principal if h >= 11),
+        "best_set_11_plus": sum(1 for h in best if h >= 11),
+        "best_set_12_plus": sum(1 for h in best if h >= 12),
+        "derived_improved_games": sum(1 for r in rows if r["best_delta"] > 0),
+        "derived_same_games": sum(1 for r in rows if r["best_delta"] == 0),
+        "total_best_delta": sum(r["best_delta"] for r in rows),
+    }
+
+
+def plan_rank_key(candidate: Dict[str, Any]) -> Tuple[float, int, int, int, int]:
+    summary = candidate.get("summary", {})
+    return (
+        float(summary.get("best_set_average", 0)),
+        int(summary.get("best_set_11_plus", 0)),
+        int(summary.get("best_set_12_plus", 0)),
+        int(summary.get("derived_improved_games", 0)),
+        int(summary.get("total_best_delta", 0)),
+    )
+
+
+@app.get("/plan/recommended", response_class=JSONResponse)
+async def plan_recommended(
+    window: str = Query("3m", pattern=r"^((\d{1,2})m|all)$"),
+    limit: int = Query(30, ge=5, le=80),
+    history: int = Query(50, ge=20, le=120),
+    force: bool = False,
+):
+    cache = None if force else _agg_get(
+        "plan_recommended", window=window, limit=limit, history=history)
+    if cache:
+        data = cache.copy()
+        ts = data.pop("_ts", None)
+        data["cache_age_seconds"] = int(time.time() - ts) if ts else None
+        return data
+
+    historical_draws = await collect_last_n(limit + history + 5)
+    if len(historical_draws) < history + 1:
+        return {
+            "ok": False,
+            "error": f"Historico insuficiente: {len(historical_draws)} concursos coletados",
+            "required_minimum": history + 1,
+        }
+
+    candidates = []
+    for even, odd in PARITY_CANDIDATES:
+        summary = summarize_derived_backtest(
+            historical_draws, even=even, odd=odd, limit=limit, history=history)
+        candidates.append({
+            "even": even,
+            "odd": odd,
+            "pattern": f"{even}-{odd}",
+            "summary": summary,
+        })
+
+    ranked = sorted(candidates, key=plan_rank_key, reverse=True)
+    recommended = ranked[0]
+
+    sd, ed = window_to_range(window)
+    current_draws = await collect_by_date(sd, ed, max_fetch=400)
+    if len(current_draws) < 20:
+        current_draws = await collect_last_n(50)
+
+    suggestion = build_parity_suggestion(
+        current_draws,
+        even_needed=recommended["even"],
+        odd_needed=recommended["odd"],
+    )
+
+    payload = {
+        "ok": True,
+        "window": window,
+        "recommended": recommended,
+        "candidates": ranked,
+        "suggestion": suggestion,
+        "considered_games": len(current_draws),
+        "method": "auto_parity_derived_backtest",
+        "updated_at": dt.datetime.now(BRT).strftime("%d/%m/%Y %H:%M:%S"),
+        "cache_age_seconds": None,
+    }
+    _agg_put(payload, "plan_recommended", window=window, limit=limit, history=history)
+    payload["cache_age_seconds"] = 0
+    return payload
+
 # ----------------------------------------------------------------------
 # UI (com spinner, PT-BR, manifest e SW)
 # ----------------------------------------------------------------------
@@ -1489,26 +1617,26 @@ button:disabled{opacity:.6;cursor:not-allowed}
 .history-numbers{display:flex;gap:5px;flex-wrap:wrap}.ball.small{width:28px;height:28px;font-size:12px;border-width:1px}
 .history-pattern{justify-self:center}
 .derived-list{display:grid;gap:10px}.derived-card{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:10px;display:grid;gap:8px}.derived-head{display:flex;justify-content:space-between;gap:8px;align-items:center}.derived-title{font-weight:800}.derived-meta{display:flex;gap:6px;flex-wrap:wrap}.exclusion-line{margin-top:12px;color:var(--muted);font-size:13px}
-.lab-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}.lab-box{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:10px}.lab-box span{display:block;color:var(--muted);font-size:11px;font-weight:800;text-transform:uppercase}.lab-box strong{display:block;margin-top:4px;font-size:18px}.rank-list{display:flex;gap:6px;flex-wrap:wrap;margin-top:10px}
+.play-plan{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:12px;display:grid;gap:10px}.play-plan strong{font-size:20px}.play-plan-actions{display:flex;gap:8px;flex-wrap:wrap}.rank-list{display:flex;gap:6px;flex-wrap:wrap;margin-top:10px}
 .loading-text{color:var(--muted);font-size:13px}
-@media(max-width:768px){.main-stack{gap:12px}.simulation-main{order:1}.tested-card{order:2}.official-card{order:3}.suggestion-card{order:4}.derived-section{order:5}.lab-section{order:6}.history-section{order:7}.simulation-head{display:block}.hit-display{font-size:26px}.sim-badges{gap:6px}.sim-legend{margin-top:12px}.history-card{grid-template-columns:1fr;gap:8px;padding:12px}.history-pattern{justify-self:start}.history-numbers{gap:4px}.ball.small{width:26px;height:26px;font-size:11px}.lab-grid{grid-template-columns:1fr}}
+@media(max-width:768px){.main-stack{gap:12px}.simulation-main{order:1}.lab-section{order:2}.derived-section{order:3}.tested-card{order:4}.official-card{order:5}.suggestion-card{order:6}.history-section{order:7}.simulation-head{display:block}.hit-display{font-size:26px}.sim-badges{gap:6px}.sim-legend{margin-top:12px}.history-card{grid-template-columns:1fr;gap:8px;padding:12px}.history-pattern{justify-self:start}.history-numbers{gap:4px}.ball.small{width:26px;height:26px;font-size:11px}}
 @media(min-width:769px) and (max-width:980px){.history-card{grid-template-columns:96px minmax(0,1fr) 58px}}
 @media(max-width:380px){.hit-display{font-size:24px}.ball.small{width:25px;height:25px;font-size:10px}}
 </style>
 </head>
 <body>
 <div class="wrap">
-  <div class="topbar"><div><h1>Lotofácil</h1><div class="subtitle">Sugestão por frequência e paridade com backtest automático do último concurso.</div></div><div id="requestStatus" class="status">Aguardando dados</div></div>
+  <div class="topbar"><div><h1>Lotofácil</h1><div class="subtitle">Robô com seleção automática de paridade e backtest do último concurso.</div></div><div id="requestStatus" class="status">Aguardando dados</div></div>
   <div class="grid">
     <aside>
-      <div class="card"><div class="title">Parâmetros <span id="currentPattern" class="pill">8-7</span></div><div class="form"><div class="field"><label for="selWindow">Janela</label><select id="selWindow"><option value="1m">1 mês</option><option value="3m" selected>3 meses</option><option value="6m">6 meses</option><option value="all">Tudo</option></select></div><div class="split"><div class="field"><label for="inpEven">Pares</label><input id="inpEven" type="text" value="8" inputmode="numeric" pattern="[0-9]*" maxlength="2" autocomplete="off"></div><div class="field"><label for="inpOdd">Ímpares</label><input id="inpOdd" type="text" value="7" inputmode="numeric" pattern="[0-9]*" maxlength="2" autocomplete="off"></div></div><button id="btnRefresh" type="button">Atualizar</button></div><div class="summary"><div class="metric"><span>Jogos</span><strong id="gamesMetric">-</strong></div><div class="metric"><span>Paridade</span><strong id="patternMetric">8-7</strong></div><div class="metric"><span>Acertos</span><strong id="hitsMetric">-</strong></div></div></div>
+      <div class="card"><div class="title">Configuração automática <span id="currentPattern" class="pill">Auto</span></div><div class="form"><div class="field"><label for="selWindow">Janela</label><select id="selWindow"><option value="1m">1 mês</option><option value="3m" selected>3 meses</option><option value="6m">6 meses</option><option value="all">Tudo</option></select></div><button id="btnRefresh" type="button">Atualizar</button></div><div class="summary"><div class="metric"><span>Jogos</span><strong id="gamesMetric">-</strong></div><div class="metric"><span>Paridade</span><strong id="patternMetric">Auto</strong></div><div class="metric"><span>Acertos</span><strong id="hitsMetric">-</strong></div></div></div>
     </aside>
     <main class="main-stack">
       <div id="simulationCard" class="card simulation-main neutral"><div class="simulation-head"><div class="title">Simulação automática</div><span id="contestBadge" class="badge badge-blue">Último concurso</span></div><div id="autoResult" class="result-line"><div class="loading-text">Executando backtest...</div></div><div class="legend sim-legend"><div class="legend-item"><span class="dot even"></span>Par</div><div class="legend-item"><span class="dot odd"></span>Ímpar</div><div class="legend-item"><span class="dot hit"></span>Acerto</div></div></div>
+      <div class="card lab-section"><div class="title">Plano recomendado <span id="labStatus" class="badge badge-neutral">Aguardando</span></div><div id="labContent" class="loading-text">O plano será definido após gerar os jogos.</div></div>
+      <div class="card derived-section"><div class="title">Jogos derivados <span id="derivedStatus" class="badge badge-neutral">-</span></div><div id="derivedList" class="derived-list"><div class="loading-text">Aguardando sugestão...</div></div><div id="exclusionLine" class="exclusion-line"></div></div>
       <div class="split"><div class="card tested-card"><div class="title">Sugestão testada</div><div id="autoSuggested" class="balls"></div></div><div class="card official-card"><div class="title">Resultado oficial</div><div id="autoOfficial" class="balls"></div></div></div>
       <div class="card suggestion-card"><div class="title">Combinação sugerida <span id="suggestionPattern" class="pill">-</span></div><div id="suggBalls" class="balls"></div></div>
-      <div class="card derived-section"><div class="title">Jogos derivados <span id="derivedStatus" class="badge badge-neutral">-</span></div><div id="derivedList" class="derived-list"><div class="loading-text">Aguardando sugestão...</div></div><div id="exclusionLine" class="exclusion-line"></div></div>
-      <div class="card lab-section"><div class="title">Laboratório <span id="labStatus" class="badge badge-neutral">Aguardando</span></div><div id="labContent" class="loading-text">Análise histórica será carregada após a sugestão.</div></div>
       <div class="card history-section"><div class="title">Últimos 10 concursos oficiais <span id="historyStatus" class="badge badge-neutral">Carregando</span></div><div id="historyList" class="history-list"><div class="loading-text">Carregando últimos concursos...</div></div></div>
     </main>
   </div>
@@ -1520,25 +1648,19 @@ let requestSeq = 0;
 const pad = n => String(n).padStart(2,'0');
 const qs = params => new URLSearchParams(params).toString();
 const el = id => document.getElementById(id);
-function clampParityValue(value, fallback){const parsed=parseInt(value,10);return Number.isInteger(parsed)?Math.max(0,Math.min(15,parsed)):fallback;}
 async function api(path, params, signal){const url=`${API}${path}?${qs({...params,t:Date.now()})}`;const r=await fetch(url,{cache:'no-store',headers:{'Cache-Control':'no-cache','Accept':'application/json'},signal});const data=await r.json();if(!r.ok||data.ok===false){throw new Error(data.detail||data.error||`HTTP ${r.status}`)}return data;}
 function updatePattern(E,O){const pattern=`${E}-${O}`;el('currentPattern').innerText=pattern;el('patternMetric').innerText=pattern;}
-function cleanNumericInput(id){el(id).value=el(id).value.replace(/\\D/g,'').slice(0,2);}
-function finishEvenEdit(){if(el('inpEven').value==='')el('inpEven').value='8';const E=clampParityValue(el('inpEven').value,8);el('inpEven').value=E;el('inpOdd').value=15-E;updatePattern(E,15-E);}
-function finishOddEdit(){if(el('inpOdd').value==='')el('inpOdd').value='7';const O=clampParityValue(el('inpOdd').value,7);el('inpOdd').value=O;el('inpEven').value=15-O;updatePattern(15-O,O);}
-function readParity(){let E=clampParityValue(el('inpEven').value,8);let O=clampParityValue(el('inpOdd').value,15-E);if(E+O!==15)O=15-E;el('inpEven').value=E;el('inpOdd').value=O;updatePattern(E,O);return{E,O};}
 function renderBalls(targetId,numbers,hits=new Set()){el(targetId).innerHTML=(numbers||[]).map(n=>{const parityClass=n%2===0?'even':'odd';const hitClass=hits.has(n)?' hit':'';return `<div class="ball ${parityClass}${hitClass}" title="Dezena ${pad(n)}">${pad(n)}</div>`}).join('');}
-function setLoading(E,O){el('requestStatus').innerText=`Atualizando ${E}-${O}...`;el('suggBalls').innerHTML='<div class="loading-text">Atualizando sugestão...</div>';el('derivedList').innerHTML='<div class="loading-text">Gerando jogos derivados...</div>';el('derivedStatus').innerText='...';el('exclusionLine').innerText='';el('autoSuggested').innerHTML='';el('autoOfficial').innerHTML='';el('autoResult').innerHTML='<div class="loading-text">Executando backtest...</div>';el('hitsMetric').innerText='-';el('simulationCard').className='card simulation-main neutral';el('btnRefresh').disabled=true;el('btnRefresh').innerText='Atualizando...';}
+function setLoading(){el('requestStatus').innerText='Escolhendo melhor paridade...';el('currentPattern').innerText='Auto';el('patternMetric').innerText='Auto';el('suggBalls').innerHTML='<div class="loading-text">Atualizando sugestão...</div>';el('derivedList').innerHTML='<div class="loading-text">Gerando jogos derivados...</div>';el('derivedStatus').innerText='...';el('exclusionLine').innerText='';el('autoSuggested').innerHTML='';el('autoOfficial').innerHTML='';el('autoResult').innerHTML='<div class="loading-text">Executando backtest...</div>';el('hitsMetric').innerText='-';el('labStatus').innerText='Definindo';el('labContent').innerHTML='<div class="loading-text">Definindo plano de jogo...</div>';el('simulationCard').className='card simulation-main neutral';el('btnRefresh').disabled=true;el('btnRefresh').innerText='Atualizando...';}
 function setDone(){el('requestStatus').innerText='Dados atualizados';el('btnRefresh').disabled=false;el('btnRefresh').innerText='Atualizar';}
 function setError(message){el('requestStatus').innerText='Erro ao atualizar';el('autoResult').innerHTML=`<span class="error">${message}</span>`;el('btnRefresh').disabled=false;el('btnRefresh').innerText='Atualizar';}
 function renderInlineBalls(numbers,hits=new Set()){return (numbers||[]).map(n=>`<span class="ball small ${n%2===0?'even':'odd'}${hits.has(n)?' hit':''}">${pad(n)}</span>`).join('');}
-function renderDerivedGames(games=[],exclusions=null){const list=games.slice(0,6);el('derivedStatus').innerText=`${list.length} jogos`;el('derivedList').innerHTML=list.map(g=>{const hits=new Set(g.hits||[]);const hitBadge=Number.isInteger(g.hits_count)?`<span class="badge ${g.hits_count>=11?'badge-green':'badge-neutral'}">${g.hits_count} acertos</span>`:'';const changes=(g.changed_in||[]).length?`<span class="badge badge-blue">Entram ${(g.changed_in||[]).map(pad).join('-')}</span><span class="badge badge-neutral">Saem ${(g.changed_out||[]).map(pad).join('-')}</span>`:'<span class="badge badge-yellow">Principal</span>';return `<div class="derived-card"><div class="derived-head"><div class="derived-title">Jogo ${g.index}</div><div class="derived-meta">${hitBadge}<span class="badge badge-blue">${g.pattern}</span>${changes}</div></div><div class="history-numbers">${renderInlineBalls(g.numbers,hits)}</div></div>`}).join('')||'<div class="loading-text">Nenhum jogo derivado disponível.</div>';const ex3=exclusions?.exclude_3||[];el('exclusionLine').innerText=ex3.length?`Exclusão sugerida: ${ex3.map(pad).join(', ')}`:'';}
-function renderRanking(ranking){const strong=(ranking?.strong||[]).slice(0,8).map(x=>`<span class="badge badge-blue">${pad(x.n)} · ${Math.round(x.score)}</span>`).join('');const risk=(ranking?.risk||[]).slice(0,6).map(x=>`<span class="badge badge-neutral">${pad(x.n)} · ${Math.round(x.score)}</span>`).join('');return `<div class="rank-list">${strong}</div><div class="exclusion-line">Em risco: ${risk||'-'}</div>`;}
-async function loadLab(E,O,ranking){el('labStatus').innerText='Calculando';el('labContent').innerHTML='<div class="loading-text">Rodando laboratório histórico...</div>';try{const [derived,opt]=await Promise.all([api('/backtest/derived',{limit:30,even:E,odd:O,history:50}),api('/optimizer/weights',{limit:30,even:E,odd:O,history:50})]);const s=derived.summary||{};const best=opt.best_profile||{};el('labStatus').innerText='Atualizado';el('labContent').innerHTML=`<div class="lab-grid"><div class="lab-box"><span>Principal médio</span><strong>${s.principal_average??'-'}</strong></div><div class="lab-box"><span>Melhor conjunto</span><strong>${s.best_set_average??'-'}</strong></div><div class="lab-box"><span>Perfil vencedor</span><strong>${best.profile?.name||'-'}</strong></div></div><div class="sim-badges" style="margin-top:10px"><span class="badge badge-green">Derivados melhoraram ${s.derived_improved_games??0}</span><span class="badge badge-blue">11+ no conjunto ${s.best_set_11_plus??0}</span><span class="badge badge-yellow">12+ no conjunto ${s.best_set_12_plus??0}</span></div>${renderRanking(ranking)}`;}catch(err){el('labStatus').innerText='Erro';el('labContent').innerHTML=`<span class="error">${err.message||'Falha no laboratório'}</span>`;}}
+function renderDerivedGames(games=[]){const list=games.slice(0,6);el('derivedStatus').innerText=`${list.length} jogos`;el('derivedList').innerHTML=list.map(g=>{const changes=(g.changed_in||[]).length?`<span class="badge badge-blue">Variação</span>`:'<span class="badge badge-yellow">Principal</span>';return `<div class="derived-card"><div class="derived-head"><div class="derived-title">Jogo ${g.index}</div><div class="derived-meta"><span class="badge badge-blue">${g.pattern}</span>${changes}</div></div><div class="history-numbers">${renderInlineBalls(g.numbers)}</div></div>`}).join('')||'<div class="loading-text">Nenhum jogo derivado disponível.</div>';el('exclusionLine').innerText='';}
+function renderPlan(E,O,games=[],summary={}){const qtd=Math.min(games.length||6,6);el('labStatus').innerText='Pronto';el('labContent').innerHTML=`<div class="play-plan"><strong>Jogar o conjunto completo</strong><div class="play-plan-actions"><span class="badge badge-green">${qtd} jogos recomendados</span><span class="badge badge-blue">Paridade ${E}-${O}</span></div><div class="loading-text">Use os jogos listados em “Jogos derivados”.</div></div>`;}
 function renderHistory(draws){el('historyList').innerHTML=(draws||[]).map(d=>{const nums=d.numbers||[];const even=d.even_count??nums.filter(n=>n%2===0).length;const odd=d.odd_count??nums.filter(n=>n%2===1).length;const balls=nums.map(n=>`<span class="ball small ${n%2===0?'even':'odd'}">${pad(n)}</span>`).join('');return `<div class="history-card"><div class="history-meta"><div class="history-contest">Concurso ${d.contest}</div><div class="history-date">${d.date||'-'}</div></div><div class="history-numbers">${balls}</div><div class="history-pattern badge badge-blue">${even}-${odd}</div></div>`}).join('');}
 async function loadHistory(){el('historyStatus').innerText='Carregando';el('historyList').innerHTML='<div class="loading-text">Carregando últimos concursos...</div>';try{const data=await api('/lotofacil',{limit:10});renderHistory(data.results||[]);el('historyStatus').innerText=`${data.count||0} jogos`;}catch(err){el('historyStatus').innerText='Erro';el('historyList').innerHTML=`<span class="error">${err.message||'Falha ao carregar histórico'}</span>`;}}
-async function loadAll(force=false){const seq=++requestSeq;if(activeController)activeController.abort();activeController=new AbortController();const signal=activeController.signal;const {E,O}=readParity();const w=el('selWindow').value;setLoading(E,O);try{const p=await api('/parity',{window:w,even:E,odd:O,...(force?{force:true}:{})},signal);if(seq!==requestSeq)return;renderBalls('suggBalls',p.suggestion.combo);renderDerivedGames(p.suggestion.games||[],p.suggestion.exclusions);el('suggestionPattern').innerText=p.pattern||p.suggestion.pattern||`${E}-${O}`;el('gamesMetric').innerText=p.considered_games??'-';el('autoResult').innerHTML='<div class="loading-text">Executando backtest...</div>';const backtestPath=`/backtest/latest?even=${E}&odd=${O}`;console.log('[APP] Backtest:',backtestPath);const b=await api('/backtest/latest',{even:E,odd:O},signal);if(seq!==requestSeq)return;const hits=new Set(b.hits||[]);const didWin=(b.hits_count||0)>=11;renderBalls('autoSuggested',b.suggested,hits);renderBalls('autoOfficial',b.official,hits);renderDerivedGames(b.games_tested||p.suggestion.games||[],b.exclusions||p.suggestion.exclusions);el('simulationCard').className=`card simulation-main ${didWin?'win':'neutral'}`;el('contestBadge').className='badge badge-blue';el('contestBadge').innerText=`Concurso ${b.contest}`;el('hitsMetric').innerText=b.hits_count;el('patternMetric').innerText=b.pattern;el('currentPattern').innerText=b.pattern;el('autoResult').innerHTML=`<div class="hit-display">${didWin?'&#9989;':'&bull;'} ${b.hits_count} acertos</div><div class="sim-badges"><span class="badge ${didWin?'badge-green':'badge-neutral'}">${b.hits_count} acertos</span><span class="badge badge-blue">Paridade ${b.pattern}</span><span class="badge badge-yellow">Concurso ${b.contest}</span></div>`;setDone();loadLab(E,O,p.suggestion.meta?.number_ranking);}catch(err){if(err.name==='AbortError')return;setError(err.message||'Falha inesperada');}}
-document.addEventListener('DOMContentLoaded',()=>{el('inpEven').addEventListener('input',()=>cleanNumericInput('inpEven'));el('inpOdd').addEventListener('input',()=>cleanNumericInput('inpOdd'));el('inpEven').addEventListener('blur',()=>{finishEvenEdit();loadAll(false);});el('inpOdd').addEventListener('blur',()=>{finishOddEdit();loadAll(false);});el('selWindow').addEventListener('change',()=>loadAll(false));el('btnRefresh').addEventListener('click',()=>loadAll(true));loadAll(false);loadHistory();});
+async function loadAll(force=false){const seq=++requestSeq;if(activeController)activeController.abort();activeController=new AbortController();const signal=activeController.signal;const w=el('selWindow').value;setLoading();try{const p=await api('/plan/recommended',{window:w,limit:30,history:50,...(force?{force:true}:{})},signal);if(seq!==requestSeq)return;const rec=p.recommended||{};const E=rec.even;const O=rec.odd;updatePattern(E,O);renderBalls('suggBalls',p.suggestion.combo);renderDerivedGames(p.suggestion.games||[]);el('suggestionPattern').innerText=p.suggestion.pattern||rec.pattern||`${E}-${O}`;el('gamesMetric').innerText=p.considered_games??'-';el('autoResult').innerHTML='<div class="loading-text">Executando backtest...</div>';const backtestPath=`/backtest/latest?even=${E}&odd=${O}`;console.log('[APP] Backtest:',backtestPath);const b=await api('/backtest/latest',{even:E,odd:O},signal);if(seq!==requestSeq)return;const hits=new Set(b.hits||[]);const didWin=(b.hits_count||0)>=11;const shownGames=b.games_tested||p.suggestion.games||[];renderBalls('autoSuggested',b.suggested,hits);renderBalls('autoOfficial',b.official,hits);renderDerivedGames(shownGames);el('simulationCard').className=`card simulation-main ${didWin?'win':'neutral'}`;el('contestBadge').className='badge badge-blue';el('contestBadge').innerText=`Concurso ${b.contest}`;el('hitsMetric').innerText=b.hits_count;el('patternMetric').innerText=b.pattern;el('currentPattern').innerText=b.pattern;el('autoResult').innerHTML=`<div class="hit-display">${didWin?'&#9989;':'&bull;'} ${b.hits_count} acertos</div><div class="sim-badges"><span class="badge ${didWin?'badge-green':'badge-neutral'}">${b.hits_count} acertos</span><span class="badge badge-blue">Paridade ${b.pattern}</span><span class="badge badge-yellow">Concurso ${b.contest}</span></div>`;renderPlan(E,O,shownGames,rec.summary||{});setDone();}catch(err){if(err.name==='AbortError')return;setError(err.message||'Falha inesperada');}}
+document.addEventListener('DOMContentLoaded',()=>{el('selWindow').addEventListener('change',()=>loadAll(false));el('btnRefresh').addEventListener('click',()=>loadAll(true));loadAll(false);loadHistory();});
 </script>
 </body>
 </html>
